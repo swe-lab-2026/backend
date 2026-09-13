@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "creepy-im-backend"
+version = "0.1.0"
+description = "Creepy.IM backend: auth, subscription gating and the cloud agent proxy"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.34,<1",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "sqlalchemy[asyncio]>=2.0,<2.2",
+  "asyncpg>=0.30,<1",
+  "redis>=6,<9",
+  "httpx>=0.28,<1",
+  # [crypto] enables RS256, required to sign Google Play service-account
+  # assertions. Plain PyJWT raises NotImplementedError at call time.
+  "PyJWT[crypto]>=2.10,<3",
+  "orjson>=3.10,<4",
+  "email-validator>=2,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<2",
+  "aiosqlite>=0.20,<1",
+  "ruff>=0.9,<1",
+  "mypy>=1.14,<2",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's Depends(...) in argument defaults is the framework idiom.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "."
+packages = ["app"]
+warn_unused_ignores = true
+check_untyped_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false

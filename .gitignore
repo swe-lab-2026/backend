@@ -1,0 +1,31 @@
+.env
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.pyc
+*.egg-info/
+*.db
+secrets/
+
+# Exported GGUF weight bundles served by /models. These are build outputs from
+# the android repo's export step (8.8 GB at three profiles) and are deployed
+# out of band, not through git. MODEL_ARTIFACT_ROOT points at wherever they
+# actually live.
+app/models/
+
+# Google Play service-account keys. PLAY_SERVICE_ACCOUNT_FILE should point
+# outside the repo, but a key committed by accident is a key that must be
+# rotated, so the usual names are refused here too.
+*service-account*.json
+play-*.json
+
+.DS_Store
+
+# Converted model weights. Multi-GB binaries that are reproducible from the
+# merged teacher via docker/llama/convert.sh — committing them would put
+# gigabytes in every clone for something a build step regenerates.
+/models/
+*.gguf
