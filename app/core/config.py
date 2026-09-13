@@ -14,18 +14,18 @@ class Settings(BaseSettings):
 
     app_env: str = "development"
     app_debug: bool = False
-    app_name: str = "Creepy.IM API"
+    app_name: str = "Swe API"
     app_version: str = "0.1.0"
     cors_origins: str = ""
 
-    database_url: str = "postgresql+asyncpg://creepy:creepy@localhost:5432/creepy"
+    database_url: str = "postgresql+asyncpg://swedb:swedb@localhost:5432/swedb"
     redis_url: str = "redis://localhost:6379/0"
     apply_schema_on_startup: bool = True
     schema_file: str = "sql/migrate_001.sql"
 
     jwt_secret: str = Field(default="")
-    jwt_issuer: str = "creepy-im"
-    jwt_audience: str = "creepy-im-api"
+    jwt_issuer: str = "swe-api"
+    jwt_audience: str = "swe-api"
     access_token_ttl_minutes: int = Field(default=15, ge=1, le=1440)
     refresh_token_ttl_days: int = Field(default=30, ge=1, le=365)
 
@@ -89,7 +89,7 @@ class Settings(BaseSettings):
     # The service account must have "View financial data" on the Play Console
     # and be linked to the app. Either point at a mounted key file or paste the
     # JSON; the file is preferred so the key never lands in `docker inspect`.
-    play_package_name: str = "im.creepy.app"
+    play_package_name: str = "im.swe.app"
     play_service_account_file: str = ""
     play_service_account_json: str = ""
     play_api_timeout_seconds: float = Field(default=20.0, ge=1, le=120)
