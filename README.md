@@ -228,9 +228,10 @@ Support хранит обращения пользователей. Audit фик
 
 | Модуль | Основные endpoints |
 |---|---|
-| Auth | `/auth/register`, `/auth/verify-email`, `/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/forgot-password`, `/auth/reset-password` |
-| Users | `/users/me`, `/users/me/sessions` |
-| Events | `/events`, `/events/{event_id}`, `/events/{event_id}/publish` |
+| Auth | `/auth/register`, `/auth/verify-email`, `/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/resend-verification`, `/auth/logout-all` |
+| Users | `/users/me` |
+| Organizers | `/organizers/me`, `/organizers/me/payout-account` |
+| Events | `/events/assigned`, `/events/{event_id}/admins`, `/events/{event_id}/admins/{user_id}` |
 | Ticket types | `/events/{event_id}/ticket-types` |
 | Campaigns | `/events/{event_id}/campaigns`, `/campaigns/validate` |
 | Orders | `/orders`, `/orders/{order_id}`, `/orders/{order_id}/checkout` |
@@ -552,4 +553,113 @@ GET /health/ready  — FastAPI может подключиться к PostgreSQL
 | SMS | Не входит в MVP |
 | OAuth2 login | После MVP при необходимости |
 | SSO | Не требуется для текущего типа продукта |
+
+---
+
+## 16. Профиль организатора и Event Admin
+
+### 16.1. Профиль организатора
+
+Все endpoints требуют подтверждённый email (`Depends(require_verified_user)`) и работают только с профилем текущего JWT-пользователя. `user_id`, `verification_status`, `created_at` и `updated_at` нельзя задать через body.
+
+```http
+POST   /api/v1/organizers/me                  # создать профиль (201)
+GET    /api/v1/organizers/me                  # свой профиль (404 ORGANIZER_PROFILE_NOT_FOUND, если нет)
+PATCH  /api/v1/organizers/me                  # частичное обновление
+PUT    /api/v1/organizers/me/payout-account   # демонстрационный payout-аккаунт
+```
+
+Пример создания профиля:
+
+```json
+{
+  "display_name": "BiletFlow Events",
+  "legal_name": "BiletFlow Events LLP",
+  "contact_email": "organizer@example.com",
+  "contact_phone": "+77001234567",
+  "terms_accepted": true
+}
+```
+
+- Один пользователь — один `OrganizerProfile`; повторное создание → `409 ORGANIZER_PROFILE_ALREADY_EXISTS`.
+- `verification_status` начинается с `NOT_SUBMITTED` и меняется только бэкендом.
+- Payout — демонстрационная информация: `status` всегда `PENDING` при создании, `external_account_ref` маскируется в ответе (`****-001`). Номера карт/CVV не принимаются и не сохраняются.
+- Если `is_default=true`, предыдущий default-аккаунт этого организатора автоматически снимается (одна транзакция).
+
+### 16.2. Event Admin
+
+Event Admin — **event-scoped** роль (`event_staff.role = EVENT_ADMIN`), а не глобальная. При назначении `users.global_role` не меняется. Назначения не кладутся в JWT: права проверяются запросом к PostgreSQL на каждый вызов, поэтому удаление назначения действует немедленно.
+
+```http
+GET    /api/v1/events/assigned                        # события, где current_user = EVENT_ADMIN (пагинация limit/offset)
+GET    /api/v1/events/{event_id}/admins               # список Event Admin события
+POST   /api/v1/events/{event_id}/admins               # назначить (body: {"email": "..."})
+DELETE /api/v1/events/{event_id}/admins/{user_id}     # удалить назначение (204)
+```
+
+Пример назначения:
+
+```json
+{
+  "email": "event-admin@example.com"
+}
+```
+
+Правила назначения:
+
+- назначать/удалять может только владелец события или `PLATFORM_ADMIN`;
+- целевой пользователь должен существовать, быть `ACTIVE` и иметь подтверждённый email;
+- нельзя назначить владельца администратором собственного события (`409 EVENT_OWNER_CANNOT_BE_ADMIN`);
+- повторное назначение `(event_id, user_id)` → `409 EVENT_ADMIN_ALREADY_ASSIGNED`;
+- Event Admin получает только `{"view_event": true, "check_in_tickets": true}` — он не может менять владельца, управлять персоналом или видеть другие события.
+
+Event Admin видит только события, где есть запись `event_staff(event_id, user_id)`. Фильтрация выполняется SQL-join-ом `events ⋈ event_staff`, а не в Python.
+
+### 16.3. PLATFORM_ADMIN vs EVENT_ADMIN
+
+| | PLATFORM_ADMIN | EVENT_ADMIN |
+|---|---|---|
+| Область | Платформа целиком | Одно конкретное событие |
+| Хранение | `users.global_role` | строка в `event_staff` |
+| Назначение | вручную на бэкенде | владелец события или `PLATFORM_ADMIN` |
+| Видит события | любые | только назначенные |
+| Управляет персоналом события | да | нет |
+| Check-in события | да | да (пока назначение активно) |
+
+### 16.4. Event-scoped authorization
+
+- `require_event_owner(event_id)` — владелец события или `PLATFORM_ADMIN` (управление персоналом).
+- `require_event_staff_role(*roles)` — только персонал события с указанной ролью.
+- `require_event_checkin_access(event_id)` — владелец, `PLATFORM_ADMIN` или активный `EVENT_ADMIN`/`CHECK_IN_STAFF` события. Предназначена для будущего check-in API.
+
+Отказы фиксируются в `audit_logs` как `event.staff_access_denied`.
+
+### 16.5. Audit
+
+| Действие | `action` |
+|---|---|
+| Создание профиля | `organizer.profile_created` |
+| Обновление профиля | `organizer.profile_updated` |
+| Изменение payout-аккаунта | `organizer.payout_account_updated` |
+| Назначение Event Admin | `event.admin_assigned` |
+| Удаление Event Admin | `event.admin_removed` |
+| Отказ в event-доступе | `event.staff_access_denied` |
+
+В audit не попадают password hashes, JWT, refresh tokens и полные payout references.
+
+### 16.6. Локальный запуск тестов
+
+```bash
+cp .env.example .env            # заполнить JWT_ACCESS_SECRET / JWT_REFRESH_SECRET
+pip install -e ".[dev]"         # pytest, aiosqlite, ruff, mypy
+make lint                       # ruff check app tests
+make typecheck                  # mypy
+make test                       # pytest
+```
+
+Тесты по умолчанию используют sqlite in-memory (тестовый fallback проекта). Для прогона на отдельной тестовой PostgreSQL:
+
+```bash
+TEST_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/test_db pytest
+```
 

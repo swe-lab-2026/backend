@@ -318,6 +318,7 @@ class PayoutAccount(Base):
             "organizer_user_id",
             unique=True,
             postgresql_where=text("is_default"),
+            sqlite_where=text("is_default"),
         ),
     )
 

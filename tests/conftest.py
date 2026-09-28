@@ -1,5 +1,6 @@
 import os
 from collections.abc import AsyncIterator
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest_asyncio
@@ -13,7 +14,8 @@ os.environ.setdefault("JWT_REFRESH_SECRET", "u" * 64)
 os.environ.setdefault("APP_ENV", "test")
 
 from app.core.config import Settings
-from app.db.models import Base, User, UserStatus
+from app.core.security import create_access_token, hash_password
+from app.db.models import Base, Event, User, UserRole, UserStatus
 from app.main import create_app
 
 # Separate test database. Set TEST_DATABASE_URL to a PostgreSQL URL to run the
@@ -86,6 +88,55 @@ async def get_code(app, email: str) -> str:
 
 def bearer(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+async def create_user(
+    db: AsyncSession,
+    *,
+    email: str,
+    first_name: str = "Test",
+    last_name: str = "User",
+    verified: bool = True,
+    role: UserRole = UserRole.USER,
+    status: UserStatus = UserStatus.ACTIVE,
+) -> User:
+    user = User(
+        email=email,
+        password_hash=hash_password("StrongPassword123!"),
+        first_name=first_name,
+        last_name=last_name,
+        email_verified_at=datetime.now(timezone.utc) if verified else None,
+        global_role=role,
+        status=status,
+    )
+    db.add(user)
+    await db.commit()
+    return user
+
+
+def access_token_for(app, user: User) -> str:
+    return create_access_token(
+        app.state.settings, user_id=str(user.id), role=user.global_role.value
+    )
+
+
+async def create_event(
+    db: AsyncSession,
+    *,
+    owner_user_id: Any,
+    title: str = "Concert",
+) -> Event:
+    now = datetime.now(timezone.utc)
+    event = Event(
+        owner_user_id=owner_user_id,
+        title=title,
+        timezone="UTC",
+        starts_at=now + timedelta(days=1),
+        ends_at=now + timedelta(days=1, hours=3),
+    )
+    db.add(event)
+    await db.commit()
+    return event
 
 
 API = "/api/v1"
