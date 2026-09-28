@@ -1,4 +1,5 @@
 from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import NoReturn
 from uuid import UUID
 
 from fastapi import Depends, Request
@@ -9,7 +10,7 @@ from app.core.config import Settings
 from app.core.errors import ApiError
 from app.core.security import TOKEN_TYPE_ACCESS, decode_token
 from app.db import repositories as repo
-from app.db.models import User, UserStatus
+from app.db.models import Event, EventStaffRole, User, UserRole, UserStatus
 from app.kv.store import TTLStore
 from app.services.email import EmailProvider
 
@@ -98,3 +99,79 @@ def require_roles(*roles: str) -> Callable[..., Awaitable[User]]:
         return user
 
     return checker
+
+
+# ---------- Event-scoped authorization ----------
+
+async def _deny_event_access(db: AsyncSession, user: User, event: Event) -> NoReturn:
+    await repo.add_audit_entry(
+        db,
+        actor_user_id=user.id,
+        event_id=event.id,
+        entity_type="event",
+        entity_id=event.id,
+        action="event.staff_access_denied",
+    )
+    # Persist the audit entry before the error response rolls the surrounding
+    # transaction back.
+    await db.commit()
+    raise ApiError(403, "INSUFFICIENT_EVENT_PERMISSIONS", "Insufficient permissions for this event")
+
+
+async def require_event_owner(
+    event_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Event:
+    """Event owner or a PLATFORM_ADMIN. Used to manage a single event."""
+    event = await repo.get_event_by_id(db, event_id)
+    if event is None:
+        raise ApiError(404, "EVENT_NOT_FOUND", "Event not found")
+    if event.owner_user_id != user.id and user.global_role != UserRole.PLATFORM_ADMIN:
+        await _deny_event_access(db, user, event)
+    return event
+
+
+def require_event_staff_role(*roles: EventStaffRole) -> Callable[..., Awaitable[Event]]:
+    """Event-scoped dependency: only event staff with one of the given roles."""
+
+    async def checker(
+        event_id: UUID,
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+    ) -> Event:
+        event = await repo.get_event_by_id(db, event_id)
+        if event is None:
+            raise ApiError(404, "EVENT_NOT_FOUND", "Event not found")
+        staff = await repo.get_event_staff(db, event_id=event_id, user_id=user.id)
+        if staff is None or staff.role not in roles:
+            await _deny_event_access(db, user, event)
+        return event
+
+    return checker
+
+
+async def require_event_checkin_access(
+    event_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Event:
+    """Reusable gate for the future check-in API.
+
+    Allows the event owner, a PLATFORM_ADMIN, or active event staff with
+    EVENT_ADMIN / CHECK_IN_STAFF role. Every request re-queries PostgreSQL, so
+    removing an EventStaff row revokes access immediately, even for an
+    already-issued access token.
+    """
+    event = await repo.get_event_by_id(db, event_id)
+    if event is None:
+        raise ApiError(404, "EVENT_NOT_FOUND", "Event not found")
+    if event.owner_user_id == user.id or user.global_role == UserRole.PLATFORM_ADMIN:
+        return event
+    staff = await repo.get_event_staff(db, event_id=event_id, user_id=user.id)
+    if staff is not None and staff.role in (
+        EventStaffRole.EVENT_ADMIN,
+        EventStaffRole.CHECK_IN_STAFF,
+    ):
+        return event
+    await _deny_event_access(db, user, event)
