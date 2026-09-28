@@ -14,25 +14,23 @@ class ApiError(Exception):
         message: str,
         *,
         retryable: bool = False,
-        extra: dict[str, Any] | None = None,
+        details: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
         self.retryable = retryable
-        self.extra = extra or {}
+        self.details = details or {}
 
 
 def error_body(exc: ApiError) -> dict[str, Any]:
     return {
-        "ok": False,
-        "code": exc.code,
-        "message": exc.message,
-        # The mobile client reads `detail` first (src/auth/emailAuth.ts).
-        "detail": exc.message,
-        "retryable": exc.retryable,
-        **exc.extra,
+        "error": {
+            "code": exc.code,
+            "message": exc.message,
+            "details": exc.details,
+        }
     }
 
 
@@ -46,11 +44,11 @@ async def validation_error_handler(
     return JSONResponse(
         status_code=422,
         content={
-            "ok": False,
-            "code": "VALIDATION_ERROR",
-            "message": "Request validation failed",
-            "detail": exc.errors(),
-            "retryable": False,
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "Request validation failed",
+                "details": {"errors": exc.errors()},
+            }
         },
     )
 
@@ -60,11 +58,11 @@ async def http_exception_handler(_request: Request, exc: StarletteHTTPException)
     return JSONResponse(
         status_code=exc.status_code,
         content={
-            "ok": False,
-            "code": "HTTP_ERROR",
-            "message": message,
-            "detail": message,
-            "retryable": False,
+            "error": {
+                "code": "HTTP_ERROR",
+                "message": message,
+                "details": {},
+            }
         },
     )
 
@@ -73,10 +71,10 @@ async def unhandled_error_handler(_request: Request, _exc: Exception) -> JSONRes
     return JSONResponse(
         status_code=500,
         content={
-            "ok": False,
-            "code": "INTERNAL",
-            "message": "Internal server error",
-            "detail": "Internal server error",
-            "retryable": True,
+            "error": {
+                "code": "INTERNAL",
+                "message": "Internal server error",
+                "details": {},
+            }
         },
     )

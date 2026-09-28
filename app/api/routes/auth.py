@@ -1,35 +1,32 @@
-import logging
-from datetime import datetime, timezone
-
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_db, get_email_code_service, get_email_sender
+from app.api.deps import (
+    get_app_settings,
+    get_db,
+    get_email_provider,
+    get_store,
+    require_active_user,
+)
 from app.core.config import Settings
-from app.core.errors import ApiError
-from app.core.security import (
-    TOKEN_TYPE_REFRESH,
-    create_access_token,
-    create_refresh_token,
-    decode_token,
-)
-from app.db import repositories as repo
 from app.db.models import User
-from app.db.repositories import lifetime_period_end
-from app.db.schema import SEED_PLANS
+from app.kv.store import TTLStore
 from app.schemas.auth import (
+    LoginRequest,
+    LogoutRequest,
+    LogoutResponse,
     RefreshRequest,
-    RefreshResponse,
-    RequestCodeRequest,
-    RequestCodeResponse,
-    VerifyCodeRequest,
-    VerifyCodeResponse,
+    RegisterRequest,
+    RegisterResponse,
+    ResendVerificationRequest,
+    ResendVerificationResponse,
+    TokenResponse,
+    VerifyEmailRequest,
+    VerifyEmailResponse,
 )
-from app.services import entitlements, onboarding
-from app.services.email_codes import EmailCodeService
-from app.services.email_sender import EmailSender
-
-logger = logging.getLogger("app.auth")
+from app.services import auth as auth_service
+from app.services.auth import normalize_email
+from app.services.email import EmailProvider
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -41,202 +38,121 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-# Distinguishes "not configured as a demo account" from "configured with no
-# required name", which are different answers that a plain .get() would blur.
-_NOT_A_DEMO_ACCOUNT = object()
+def _user_agent(request: Request) -> str | None:
+    return request.headers.get("user-agent")
 
 
-def _settings(request: Request) -> Settings:
-    return request.app.state.settings
+def _token_response(pair: auth_service.TokenPair) -> TokenResponse:
+    return TokenResponse(
+        access_token=pair.access_token,
+        refresh_token=pair.refresh_token,
+        expires_in=pair.expires_in,
+    )
 
 
-@router.post("/email/request-code", response_model=RequestCodeResponse)
-async def request_code(
-    request: Request,
-    body: RequestCodeRequest,
+@router.post("/register", response_model=RegisterResponse, status_code=201)
+async def register(
+    body: RegisterRequest,
     db: AsyncSession = Depends(get_db),
-    codes: EmailCodeService = Depends(get_email_code_service),
-    sender: EmailSender = Depends(get_email_sender),
-) -> RequestCodeResponse:
-    settings = _settings(request)
-    email = body.email.lower()
-
-    # The demo sign-in needs the exact name as well as the address. A mismatch
-    # falls through to the ordinary code flow rather than erroring: a distinct
-    # response would confirm to whoever is probing that the address is real.
-    demo_name = settings.demo_account_map.get(email, _NOT_A_DEMO_ACCOUNT)
-    if demo_name is not _NOT_A_DEMO_ACCOUNT and (
-        demo_name is None or (body.name or "").strip() == demo_name
-    ):
-        return await _demo_sign_in(
-            request, db, codes, email=email, name=body.name
-        )
-
-    result = await codes.request_code(
-        email=email,
-        name=body.name,
-        purpose=body.purpose,
-        client_ip=_client_ip(request),
+    provider: EmailProvider = Depends(get_email_provider),
+    settings: Settings = Depends(get_app_settings),
+) -> RegisterResponse:
+    user, expires_in = await auth_service.register(
+        db,
+        provider,
+        settings,
+        email=body.email,
+        password=body.password,
+        first_name=body.first_name,
+        last_name=body.last_name,
     )
-    try:
-        await sender.send_verification_code(to=email, code=result.code, purpose=body.purpose)
-    except Exception as exc:
-        logger.error("failed to send verification code: %s", exc)
-        raise ApiError(
-            502,
-            "EMAIL_SEND_FAILED",
-            "Could not send the verification code. Please try again.",
-            retryable=True,
-        ) from exc
-
-    return RequestCodeResponse(
-        challenge_id=result.challenge_id,
-        expires_in_seconds=result.expires_in_seconds,
-        retry_after_seconds=result.retry_after_seconds,
+    return RegisterResponse(
+        email=user.email,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        code_expires_in=expires_in,
     )
 
 
-@router.post("/email/verify-code", response_model=VerifyCodeResponse)
-async def verify_code(
-    request: Request,
-    body: VerifyCodeRequest,
+@router.post("/verify-email", response_model=VerifyEmailResponse)
+async def verify_email(
+    body: VerifyEmailRequest,
     db: AsyncSession = Depends(get_db),
-    codes: EmailCodeService = Depends(get_email_code_service),
-) -> VerifyCodeResponse:
-    settings = _settings(request)
-    email = body.email.lower()
-    challenge = await codes.verify_code(
-        challenge_id=body.challenge_id, email=email, code=body.code
+    settings: Settings = Depends(get_app_settings),
+) -> VerifyEmailResponse:
+    user = await auth_service.verify_email(db, settings, email=body.email, code=body.code)
+    return VerifyEmailResponse(email=user.email)
+
+
+@router.post("/resend-verification", response_model=ResendVerificationResponse)
+async def resend_verification(
+    body: ResendVerificationRequest,
+    db: AsyncSession = Depends(get_db),
+    provider: EmailProvider = Depends(get_email_provider),
+    store: TTLStore = Depends(get_store),
+    settings: Settings = Depends(get_app_settings),
+) -> ResendVerificationResponse:
+    expires_in, retry_after = await auth_service.resend_verification(
+        db, provider, store, settings, email=body.email
     )
-
-    user = await repo.get_user_by_email(db, email)
-    was_new = user is None
-    if user is None:
-        user = await repo.create_user(db, email=email, name=challenge.name)
-        await _grant_free_plan(db, user)
-        logger.info("registered user %s", user.user_id)
-    else:
-        logger.info("logged in user %s", user.user_id)
-
-    onboarding_state = await onboarding.complete_after_auth(
-        db, user, was_new=was_new
-    )
-
-    access_token = create_access_token(settings, user.user_id, email)
-    refresh_token = create_refresh_token(settings, user.user_id, email)
-    return VerifyCodeResponse(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        onboarding_completed=onboarding.is_completed(onboarding_state),
-        email=email,
+    return ResendVerificationResponse(
+        email=normalize_email(body.email),
+        code_expires_in=expires_in,
+        retry_after=retry_after,
     )
 
 
-async def _demo_sign_in(
+@router.post("/login", response_model=TokenResponse)
+async def login(
     request: Request,
-    db: AsyncSession,
-    codes: EmailCodeService,
-    *,
-    email: str,
-    name: str | None,
-) -> RequestCodeResponse:
-    """Sign a demo account in without a code.
-
-    Store review needs working credentials, and a reviewer cannot read the
-    mailbox a verification code would be sent to. For addresses in
-    DEMO_ACCOUNTS the code step is therefore skipped entirely: no code is
-    generated, none is emailed, and the session is issued here.
-
-    This is a real bypass and worth being clear about — the address alone is
-    the credential, with no second factor. It is off unless DEMO_ACCOUNTS is
-    set, it should be set only on the deployment reviewers use, and the address
-    should be treated as a published secret.
-
-    Rate limiting still applies, minus two limits that would backfire:
-
-    - the per-email cap is skipped, because a single shared address would
-      otherwise let anyone lock the reviewer out with five requests;
-    - the resend cooldown is skipped, because there is no resend, and a
-      reviewer relaunching the app should not meet a 60-second wall.
-
-    The per-IP hourly cap stays, so this cannot be used to hammer the service.
-    """
-    settings = _settings(request)
-    await codes.enforce_request_limits(
-        email=email,
-        client_ip=_client_ip(request),
-        apply_cooldown=False,
-        apply_email_cap=False,
-    )
-
-    user = await repo.get_user_by_email(db, email)
-    was_new = user is None
-    if user is None:
-        user = await repo.create_user(db, email=email, name=name)
-        await _grant_free_plan(db, user)
-        logger.warning("demo sign-in: registered %s (%s)", email, user.user_id)
-    else:
-        logger.warning("demo sign-in: %s (%s)", email, user.user_id)
-
-    onboarding_state = await onboarding.complete_after_auth(
-        db, user, was_new=was_new
-    )
-
-    return RequestCodeResponse(
-        # No challenge was created; there is nothing to answer.
-        challenge_id="",
-        expires_in_seconds=0,
-        retry_after_seconds=0,
-        auto_verified=True,
-        access_token=create_access_token(settings, user.user_id, email),
-        refresh_token=create_refresh_token(settings, user.user_id, email),
-        onboarding_completed=onboarding.is_completed(onboarding_state),
-    )
-
-
-async def _grant_free_plan(db: AsyncSession, user: User) -> None:
-    free = next(plan for plan in SEED_PLANS if plan["code"] == "free")
-    plan = await repo.get_plan_by_code(db, str(free["code"]))
-    if plan is None:
-        return
-
-    now = datetime.now(timezone.utc)
-    subscription = await repo.create_subscription(
+    body: LoginRequest,
+    db: AsyncSession = Depends(get_db),
+    store: TTLStore = Depends(get_store),
+    settings: Settings = Depends(get_app_settings),
+) -> TokenResponse:
+    _, pair = await auth_service.login(
         db,
-        user_id=user.user_id,
-        plan_id=plan.plan_id,
-        status="active",
-        provider="manual",
-        provider_subscription_id=None,
-        period_start=now,
-        period_end=lifetime_period_end(),
+        store,
+        settings,
+        email=body.email,
+        password=body.password,
+        user_agent=_user_agent(request),
+        ip_address=_client_ip(request),
     )
-    await entitlements.materialize(
-        db,
-        user_id=user.user_id,
-        plan=plan,
-        expires_at=subscription.current_period_end,
-        source="grant",
-    )
+    return _token_response(pair)
 
 
-@router.post("/refresh", response_model=RefreshResponse)
+@router.post("/refresh", response_model=TokenResponse)
 async def refresh(
     request: Request,
     body: RefreshRequest,
     db: AsyncSession = Depends(get_db),
-) -> RefreshResponse:
-    settings = _settings(request)
-    subject = decode_token(settings, body.refresh_token, TOKEN_TYPE_REFRESH)
-    user = await repo.get_user_by_id(db, subject.user_id)
-    if user is None:
-        raise ApiError(401, "UNAUTHORIZED", "User no longer exists")
-    email = user.email or subject.email
-    return RefreshResponse(access_token=create_access_token(settings, user.user_id, email))
+    settings: Settings = Depends(get_app_settings),
+) -> TokenResponse:
+    pair = await auth_service.rotate_refresh_token(
+        db,
+        settings,
+        body.refresh_token,
+        user_agent=_user_agent(request),
+        ip_address=_client_ip(request),
+    )
+    return _token_response(pair)
 
 
-@router.post("/logout")
-async def logout() -> dict[str, bool]:
-    # Stateless JWTs: the client discards its tokens. Endpoint exists so the
-    # client has a stable contract (and so we can add revocation later).
-    return {"ok": True}
+@router.post("/logout", response_model=LogoutResponse)
+async def logout(
+    body: LogoutRequest,
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+) -> LogoutResponse:
+    await auth_service.logout(db, settings, body.refresh_token)
+    return LogoutResponse()
+
+
+@router.post("/logout-all", response_model=LogoutResponse)
+async def logout_all(
+    user: User = Depends(require_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> LogoutResponse:
+    await auth_service.logout_all(db, user.id)
+    return LogoutResponse()

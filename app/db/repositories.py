@@ -1,211 +1,193 @@
-import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from typing import Any, cast
+from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import CursorResult, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
-    Subscription,
-    SubscriptionEntitlement,
-    SubscriptionPlan,
+    AuditLog,
+    EmailVerificationToken,
+    RefreshSession,
     User,
-    UserOnboarding,
 )
 
-ACTIVE_SUBSCRIPTION_STATUSES = ("active", "trialing")
 
-# Sentinel distinguishing "don't touch this column" from "set it to NULL".
-_UNSET = object()
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def new_id(prefix: str) -> str:
-    return f"{prefix}_{secrets.token_hex(10)}"
-
+# ---------- Users ----------
 
 async def get_user_by_email(session: AsyncSession, email: str) -> User | None:
     result = await session.execute(select(User).where(User.email == email))
     return result.scalar_one_or_none()
 
 
-async def get_user_by_id(session: AsyncSession, user_id: str) -> User | None:
+async def get_user_by_id(session: AsyncSession, user_id: UUID) -> User | None:
     return await session.get(User, user_id)
 
 
-async def create_user(session: AsyncSession, email: str, name: str | None) -> User:
-    user = User(user_id=new_id("usr"), email=email, name=name)
+async def create_user(
+    session: AsyncSession,
+    *,
+    email: str,
+    password_hash: str,
+    first_name: str,
+    last_name: str,
+) -> User:
+    user = User(
+        email=email,
+        password_hash=password_hash,
+        first_name=first_name,
+        last_name=last_name,
+    )
     session.add(user)
     await session.flush()
     return user
 
 
-async def update_user_name(session: AsyncSession, user_id: str, name: str) -> None:
-    await session.execute(
-        update(User)
-        .values(name=name, updated_at=datetime.now(timezone.utc))
-        .where(User.user_id == user_id)
+# ---------- Email verification ----------
+
+async def create_email_verification_token(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    code_digest: str,
+    expires_at: datetime,
+) -> EmailVerificationToken:
+    token = EmailVerificationToken(
+        user_id=user_id,
+        code_digest=code_digest,
+        expires_at=expires_at,
     )
+    session.add(token)
+    await session.flush()
+    return token
 
 
-async def list_active_plans(session: AsyncSession) -> list[SubscriptionPlan]:
+async def get_latest_email_verification_token(
+    session: AsyncSession, user_id: UUID
+) -> EmailVerificationToken | None:
     result = await session.execute(
-        select(SubscriptionPlan).where(SubscriptionPlan.active.is_(True)).order_by(
-            SubscriptionPlan.amount
-        )
-    )
-    return list(result.scalars().all())
-
-
-async def get_plan_by_code(session: AsyncSession, code: str) -> SubscriptionPlan | None:
-    result = await session.execute(select(SubscriptionPlan).where(SubscriptionPlan.code == code))
-    return result.scalar_one_or_none()
-
-
-async def get_active_subscription(session: AsyncSession, user_id: str) -> Subscription | None:
-    now = datetime.now(timezone.utc)
-    result = await session.execute(
-        select(Subscription)
-        .where(
-            Subscription.user_id == user_id,
-            Subscription.status.in_(ACTIVE_SUBSCRIPTION_STATUSES),
-            Subscription.current_period_end > now,
-        )
-        .order_by(Subscription.current_period_end.desc())
+        select(EmailVerificationToken)
+        .where(EmailVerificationToken.user_id == user_id)
+        .order_by(EmailVerificationToken.created_at.desc())
         .limit(1)
     )
     return result.scalar_one_or_none()
 
 
-async def create_subscription(
+async def increment_verification_attempts(session: AsyncSession, token_id: UUID) -> None:
+    await session.execute(
+        update(EmailVerificationToken)
+        .where(EmailVerificationToken.id == token_id)
+        .values(attempt_count=EmailVerificationToken.attempt_count + 1)
+    )
+
+
+async def mark_verification_token_used(session: AsyncSession, token_id: UUID, at: datetime) -> None:
+    await session.execute(
+        update(EmailVerificationToken)
+        .where(EmailVerificationToken.id == token_id)
+        .values(used_at=at)
+    )
+
+
+# ---------- Refresh sessions ----------
+
+async def create_refresh_session(
     session: AsyncSession,
     *,
-    user_id: str,
-    plan_id: str,
-    status: str,
-    provider: str,
-    provider_subscription_id: str | None,
-    period_start: datetime,
-    period_end: datetime,
-) -> Subscription:
-    subscription = Subscription(
-        subscription_id=new_id("sub"),
+    user_id: UUID,
+    token_hash: str,
+    jti: UUID,
+    token_family: UUID,
+    user_agent: str | None,
+    ip_address: str | None,
+    expires_at: datetime,
+) -> RefreshSession:
+    session_row = RefreshSession(
         user_id=user_id,
-        plan_id=plan_id,
-        status=status,
-        provider=provider,
-        provider_subscription_id=provider_subscription_id,
-        current_period_start=period_start,
-        current_period_end=period_end,
+        token_hash=token_hash,
+        jti=jti,
+        token_family=token_family,
+        user_agent=user_agent,
+        ip_address=ip_address,
+        expires_at=expires_at,
     )
-    session.add(subscription)
+    session.add(session_row)
     await session.flush()
-    return subscription
+    return session_row
 
 
-async def cancel_subscription(session: AsyncSession, subscription: Subscription) -> None:
-    now = datetime.now(timezone.utc)
-    subscription.status = "canceled"
-    subscription.canceled_at = now
-    subscription.ended_at = now
-    subscription.updated_at = now
-    await session.flush()
+async def get_refresh_session_by_jti(
+    session: AsyncSession, jti: UUID, *, for_update: bool = False
+) -> RefreshSession | None:
+    stmt = select(RefreshSession).where(RefreshSession.jti == jti)
+    if for_update:
+        # Serializes concurrent refreshes of the same token so exactly one
+        # succeeds; the loser observes the revoked row and triggers reuse
+        # handling instead of issuing a second pair.
+        stmt = stmt.with_for_update()
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
 
 
-async def upsert_entitlements(
-    session: AsyncSession,
-    user_id: str,
-    entitlements: dict[str, datetime | None],
-    source: str,
-) -> None:
-    for name, expires_at in entitlements.items():
-        existing = await session.get(SubscriptionEntitlement, (user_id, name))
-        if existing is None:
-            session.add(
-                SubscriptionEntitlement(
-                    user_id=user_id,
-                    entitlement=name,
-                    source=source,
-                    expires_at=expires_at,
-                )
-            )
-        else:
-            existing.source = source
-            existing.granted_at = datetime.now(timezone.utc)
-            existing.expires_at = expires_at
-    await session.flush()
-
-
-async def clear_entitlements(session: AsyncSession, user_id: str) -> None:
-    existing = await session.execute(
-        select(SubscriptionEntitlement).where(SubscriptionEntitlement.user_id == user_id)
+async def revoke_refresh_session(session: AsyncSession, session_id: UUID, at: datetime) -> None:
+    await session.execute(
+        update(RefreshSession)
+        .where(RefreshSession.id == session_id)
+        .values(revoked_at=at)
     )
-    for row in existing.scalars().all():
-        await session.delete(row)
-    await session.flush()
 
 
-async def revoke_entitlement(session: AsyncSession, user_id: str, entitlement: str) -> None:
-    existing = await session.get(SubscriptionEntitlement, (user_id, entitlement))
-    if existing is not None:
-        await session.delete(existing)
-        await session.flush()
-
-
-async def get_active_entitlements(session: AsyncSession, user_id: str) -> set[str]:
-    now = datetime.now(timezone.utc)
+async def revoke_refresh_family(session: AsyncSession, token_family: UUID, at: datetime) -> int:
     result = await session.execute(
-        select(SubscriptionEntitlement.entitlement).where(
-            SubscriptionEntitlement.user_id == user_id,
-            (SubscriptionEntitlement.expires_at.is_(None))
-            | (SubscriptionEntitlement.expires_at > now),
-        )
+        update(RefreshSession)
+        .where(RefreshSession.token_family == token_family, RefreshSession.revoked_at.is_(None))
+        .values(revoked_at=at)
     )
-    return set(result.scalars().all())
+    return cast(CursorResult, result).rowcount or 0
 
 
-def lifetime_period_end() -> datetime:
-    return datetime.now(timezone.utc) + timedelta(days=365 * 100)
+async def revoke_all_user_sessions(session: AsyncSession, user_id: UUID, at: datetime) -> int:
+    result = await session.execute(
+        update(RefreshSession)
+        .where(RefreshSession.user_id == user_id, RefreshSession.revoked_at.is_(None))
+        .values(revoked_at=at)
+    )
+    return cast(CursorResult, result).rowcount or 0
 
 
-async def get_onboarding(session: AsyncSession, user_id: str) -> UserOnboarding | None:
-    return await session.get(UserOnboarding, user_id)
+async def touch_refresh_session(session: AsyncSession, session_id: UUID) -> None:
+    await session.execute(
+        update(RefreshSession)
+        .where(RefreshSession.id == session_id)
+        .values(last_used_at=_now())
+    )
 
 
-async def create_onboarding(
+# ---------- Audit ----------
+
+async def add_audit_entry(
     session: AsyncSession,
     *,
-    user_id: str,
-    version: int,
-    status: str,
-) -> UserOnboarding:
-    onboarding = UserOnboarding(user_id=user_id, version=version, status=status)
-    session.add(onboarding)
-    await session.flush()
-    return onboarding
-
-
-async def update_onboarding(
-    session: AsyncSession,
-    onboarding: UserOnboarding,
-    *,
-    status: str | None = None,
-    intents: list[str] | None = None,
-    custom_intent: str | object | None = _UNSET,
-    ai_mode: str | None = None,
-    first_task: dict | None = None,
-    feedback: dict | None = None,
+    actor_user_id: UUID | None,
+    entity_type: str,
+    entity_id: UUID | None,
+    action: str,
+    before_data: dict[str, Any] | None = None,
+    after_data: dict[str, Any] | None = None,
+    ip_address: str | None = None,
 ) -> None:
-    now = datetime.now(timezone.utc)
-    if status is not None:
-        onboarding.status = status
-    if intents is not None:
-        onboarding.intents = intents
-    if custom_intent is not _UNSET:
-        onboarding.custom_intent = custom_intent  # type: ignore[assignment]
-    if ai_mode is not None:
-        onboarding.ai_mode = ai_mode
-    if first_task is not None:
-        onboarding.first_task = first_task
-    if feedback is not None:
-        onboarding.feedback = feedback
-    onboarding.updated_at = now
-    await session.flush()
+    entry = AuditLog(
+        actor_user_id=actor_user_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        action=action,
+        before_data=before_data,
+        after_data=after_data,
+        ip_address=ip_address,
+    )
+    session.add(entry)
