@@ -1,16 +1,20 @@
 from datetime import datetime
+from uuid import UUID
 
-from pydantic import Field
-
-from app.schemas.common import CamelModel
+from pydantic import BaseModel, Field
 
 
-class UserResponse(CamelModel):
-    user_id: str
-    email: str | None
-    name: str | None
+class UserResponse(BaseModel):
+    user_id: UUID
+    email: str
+    first_name: str
+    last_name: str
+    global_role: str
+    status: str
+    email_verified_at: datetime | None
     created_at: datetime
 
 
-class UpdateUserRequest(CamelModel):
-    name: str = Field(min_length=1, max_length=200)
+class UpdateUserRequest(BaseModel):
+    first_name: str | None = Field(default=None, min_length=1, max_length=100)
+    last_name: str | None = Field(default=None, min_length=1, max_length=100)

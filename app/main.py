@@ -2,27 +2,13 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-import httpx
 import redis.asyncio as redis_async
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api.routes import (
-    admin,
-    agent,
-    auth,
-    chat,
-    device,
-    health,
-    marketing,
-    mcp,
-    models,
-    onboarding,
-    subscriptions,
-    users,
-)
+from app.api.routes import admin, auth, users
 from app.core.config import Settings, get_settings
 from app.core.errors import (
     ApiError,
@@ -32,15 +18,10 @@ from app.core.errors import (
     validation_error_handler,
 )
 from app.core.logging import RequestContextMiddleware, configure_logging
-from app.db.schema import apply_schema, seed_plans
+from app.db.schema import apply_schema
 from app.db.session import create_engine_and_session_factory
 from app.kv.store import MemoryTTLStore, RedisTTLStore, TTLStore
-from app.services.brevo_marketing import BrevoMarketingService
-from app.services.email_codes import EmailCodeService
-from app.services.email_sender import EmailSender
-from app.services.model_catalog import ModelCatalog
-from app.services.play_billing import PlayClient
-from app.services.usage import UsageMeter
+from app.services.email import EmailProvider, build_email_provider
 
 logger = logging.getLogger("app")
 
@@ -61,35 +42,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         engine, session_factory = create_engine_and_session_factory(settings.database_url)
         store, redis = _create_store(settings)
-        http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(settings.llm_timeout_seconds, connect=10.0),
-            follow_redirects=False,
-        )
-
-        if redis is not None:
-            await redis.ping()
+        email_provider: EmailProvider = build_email_provider()
 
         await apply_schema(engine, settings)
-        await seed_plans(engine)
 
         app.state.settings = settings
         app.state.engine = engine
         app.state.session_factory = session_factory
         app.state.store = store
         app.state.redis = redis
-        app.state.http_client = http_client
-        app.state.email_code_service = EmailCodeService(store, settings)
-        app.state.email_sender = EmailSender(http_client, settings)
-        app.state.brevo_marketing_service = BrevoMarketingService(http_client, settings)
-        app.state.usage_meter = UsageMeter(store)
-        app.state.play_client = PlayClient(settings, http_client)
-        app.state.model_catalog = ModelCatalog(settings)
+        app.state.email_provider = email_provider
 
         logger.info("%s started (env=%s)", settings.app_name, settings.app_env)
         try:
             yield
         finally:
-            await http_client.aclose()
             await store.aclose()
             await engine.dispose()
 
@@ -99,9 +66,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
 
-    app.add_exception_handler(
-        ApiError, api_error_handler  # type: ignore[arg-type]
-    )
+    app.add_exception_handler(ApiError, api_error_handler)  # type: ignore[arg-type]
     app.add_exception_handler(
         RequestValidationError, validation_error_handler  # type: ignore[arg-type]
     )
@@ -120,18 +85,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         expose_headers=["X-Request-ID"],
     )
 
-    app.include_router(health.router)
-    app.include_router(auth.router)
-    app.include_router(users.router)
-    app.include_router(subscriptions.router)
-    app.include_router(admin.router)
-    app.include_router(chat.router)
-    app.include_router(models.router)
-    app.include_router(agent.router)
-    app.include_router(onboarding.router)
-    app.include_router(device.router)
-    app.include_router(mcp.router)
-    app.include_router(marketing.router)
+    app.include_router(auth.router, prefix=settings.api_prefix)
+    app.include_router(users.router, prefix=settings.api_prefix)
+    app.include_router(admin.router, prefix=settings.api_prefix)
 
     @app.get("/")
     async def root() -> dict[str, str]:
