@@ -65,6 +65,26 @@ async def get_current_user(
     return user
 
 
+async def get_current_user_optional(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User | None:
+    """Resolve the caller when a token is present, otherwise treat as anonymous.
+
+    Used by public routes that behave differently for owners (e.g. showing
+    hidden ticket types only to the event owner). Any invalid or unusable token
+    is downgraded to anonymous rather than rejected, so a public endpoint stays
+    public.
+    """
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        return None
+    try:
+        return await get_current_user(request, credentials, db)
+    except ApiError:
+        return None
+
+
 async def require_active_user(user: User = Depends(get_current_user)) -> User:
     return user
 

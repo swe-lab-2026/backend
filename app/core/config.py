@@ -27,7 +27,11 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://biletflow:biletflow@localhost:5432/biletflow"
     redis_url: str = ""
     apply_schema_on_startup: bool = True
-    schema_files: list[str] = ["sql/migrate_001.sql", "sql/migrate_002_auth.sql"]
+    schema_files: list[str] = [
+        "sql/migrate_001.sql",
+        "sql/migrate_002_auth.sql",
+        "sql/migrate_003_events.sql",
+    ]
 
     # --- Auth / JWT -------------------------------------------------------
     # Access and refresh tokens use different secrets, taken only from the
