@@ -20,6 +20,7 @@ from app.db.models import (
     OrderItem,
     OrderStatus,
     OrganizerProfile,
+    PasswordResetToken,
     PayoutAccount,
     RefreshSession,
     Ticket,
@@ -108,6 +109,50 @@ async def mark_verification_token_used(session: AsyncSession, token_id: UUID, at
         .where(EmailVerificationToken.id == token_id)
         .values(used_at=at)
     )
+
+
+# ---------- Password reset ----------
+
+async def create_password_reset_token(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    token_digest: str,
+    expires_at: datetime,
+) -> PasswordResetToken:
+    token = PasswordResetToken(
+        user_id=user_id,
+        token_digest=token_digest,
+        expires_at=expires_at,
+    )
+    session.add(token)
+    await session.flush()
+    return token
+
+
+async def get_latest_password_reset_token(
+    session: AsyncSession, user_id: UUID
+) -> PasswordResetToken | None:
+    result = await session.execute(
+        select(PasswordResetToken)
+        .where(PasswordResetToken.user_id == user_id)
+        .order_by(PasswordResetToken.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def mark_password_reset_token_used(
+    session: AsyncSession, token_id: UUID, at: datetime
+) -> int:
+    # The `used_at IS NULL` guard makes concurrent confirms of the same token
+    # mutually exclusive: exactly one caller observes rowcount 1.
+    result = await session.execute(
+        update(PasswordResetToken)
+        .where(PasswordResetToken.id == token_id, PasswordResetToken.used_at.is_(None))
+        .values(used_at=at)
+    )
+    return cast(CursorResult, result).rowcount or 0
 
 
 # ---------- Refresh sessions ----------

@@ -228,7 +228,7 @@ Support хранит обращения пользователей. Audit фик
 
 | Модуль | Основные endpoints |
 |---|---|
-| Auth | `/auth/register`, `/auth/verify-email`, `/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/resend-verification`, `/auth/logout-all` |
+| Auth | `/auth/register`, `/auth/verify-email`, `/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/resend-verification`, `/auth/logout-all`, `/auth/request-password-reset`, `/auth/reset-password` |
 | Users | `/users/me` |
 | Organizers | `/organizers/me`, `/organizers/me/payout-account` |
 | Events | `/events/assigned`, `/events/{event_id}/admins`, `/events/{event_id}/admins/{user_id}` |
@@ -655,11 +655,16 @@ pip install -e ".[dev]"         # pytest, aiosqlite, ruff, mypy
 make lint                       # ruff check app tests
 make typecheck                  # mypy
 make test                       # pytest
+make migrate                    # применить SQL-миграции к DATABASE_URL
 ```
 
-Тесты по умолчанию используют sqlite in-memory (тестовый fallback проекта). Для прогона на отдельной тестовой PostgreSQL:
+SQL-миграции (`sql/migrate_*.sql`) выполняются версионированно: каждая — ровно один раз, применённые версии хранятся в таблице `schema_migrations`. Базы, созданные до введения трекинга, определяются по существующим таблицам и получают базовые версии без повторного выполнения.
+
+Тесты по умолчанию используют sqlite in-memory (тестовый fallback проекта). Для прогона на отдельной тестовой PostgreSQL (включая тест параллельного резервирования и сценарии миграций):
 
 ```bash
-TEST_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/test_db pytest
+TEST_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/test_db make test
 ```
+
+CI (`.github/workflows/ci.yml`) выполняет lint, typecheck, тесты на sqlite и полный сьют на PostgreSQL 17.
 
