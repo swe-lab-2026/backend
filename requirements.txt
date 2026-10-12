@@ -16,14 +16,17 @@ asyncpg>=0.30,<1
 # Redis (ephemeral challenges, rate limits, usage metering)
 redis>=6,<9
 
-# HTTP (Resend, LLM upstream proxy)
+# HTTP client (used by the test suite; reserved for transactional email providers)
 httpx>=0.28,<1
 
 # JWT
-# [crypto] pulls in `cryptography`, which PyJWT needs for RS256. Google
-# Play service-account assertions are RS256-signed; without it, token
-# exchange fails at runtime with NotImplementedError rather than at import.
+# [crypto] pulls in `cryptography`, keeping RS256 available if the deployment
+# switches JWT_ALGORITHM away from HS256.
 PyJWT[crypto]>=2.10,<3
+
+# Password hashing, used by app.core.security (bcrypt hashes of
+# base64(sha256(password))). The hashpw/gensalt/checkpw API is stable.
+bcrypt>=4.1,<6
 
 # Serialization
 orjson>=3.10,<4

@@ -1,0 +1,76 @@
+name: backend-ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: make lint
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: make typecheck
+
+  test-sqlite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: make test
+
+  test-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: biletflow
+          POSTGRES_PASSWORD: biletflowpw
+          POSTGRES_DB: biletflow
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U biletflow -d biletflow"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://biletflow:biletflowpw@localhost:5432/biletflow
+      DATABASE_URL: postgresql+asyncpg://biletflow:biletflowpw@localhost:5432/biletflow
+      JWT_ACCESS_SECRET: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+      JWT_REFRESH_SECRET: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      # Migration CLI smoke test: applies tracked migrations to a real database.
+      - run: make migrate
+      # Full suite against real PostgreSQL, including the row-locking
+      # concurrency test and the migration exactly-once scenarios.
+      - run: make test

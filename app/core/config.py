@@ -31,6 +31,7 @@ class Settings(BaseSettings):
         "sql/migrate_001.sql",
         "sql/migrate_002_auth.sql",
         "sql/migrate_003_events.sql",
+        "sql/migrate_004_password_reset.sql",
     ]
 
     # --- Auth / JWT -------------------------------------------------------
@@ -54,6 +55,9 @@ class Settings(BaseSettings):
     # --- Login brute-force protection --------------------------------------
     login_max_attempts: int = Field(default=5, ge=1, le=100)
     login_lockout_minutes: int = Field(default=15, ge=1, le=1440)
+
+    # --- Password reset ------------------------------------------------------
+    password_reset_ttl_minutes: int = Field(default=30, ge=5, le=120)
 
     @property
     def is_production(self) -> bool:

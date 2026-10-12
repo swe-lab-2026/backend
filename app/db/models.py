@@ -287,6 +287,32 @@ class EmailVerificationToken(Base):
     __table_args__ = (Index("idx_email_verification_tokens_user", "user_id"),)
 
 
+class PasswordResetToken(Base):
+    """One row per password-reset request. Only the token's SHA-256 digest is kept."""
+
+    __tablename__ = "password_reset_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    token_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(TimestampTz)
+    created_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
+
+    __table_args__ = (Index("idx_password_reset_tokens_user", "user_id"),)
+
+
+class SchemaMigration(Base):
+    """Ledger of applied SQL migrations, owned by the migration runner."""
+
+    __tablename__ = "schema_migrations"
+
+    version: Mapped[str] = mapped_column(String(255), primary_key=True)
+    applied_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
+
+
 class OrganizerProfile(Base):
     __tablename__ = "organizer_profiles"
 

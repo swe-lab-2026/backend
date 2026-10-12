@@ -1,4 +1,5 @@
 import logging
+import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -414,3 +415,103 @@ async def logout_all(db: AsyncSession, user_id: uuid.UUID) -> int:
         action="auth.logout_all",
     )
     return revoked
+
+
+# ---------- Password reset ----------
+
+_RESET_COOLDOWN_KEY = "pwdreset:{email}"
+_RESET_HOURLY_KEY = "pwdreset:{email}:hour"
+
+
+def _reset_expires_in(settings: Settings) -> int:
+    return settings.password_reset_ttl_minutes * 60
+
+
+async def request_password_reset(
+    db: AsyncSession,
+    provider: EmailProvider,
+    store: TTLStore,
+    settings: Settings,
+    *,
+    email: str,
+) -> tuple[int, int]:
+    email = normalize_email(email)
+
+    # Throttle before the user lookup so unknown addresses behave exactly like
+    # known ones (no 429-vs-200 oracle for account enumeration).
+    remaining = await store.ttl(_RESET_COOLDOWN_KEY.format(email=email))
+    if remaining > 0:
+        raise ApiError(429, "TOO_MANY_ATTEMPTS", f"Try again in {remaining} seconds")
+
+    count = await store.incr(_RESET_HOURLY_KEY.format(email=email), 3600)
+    if count > settings.email_code_max_per_hour:
+        raise ApiError(429, "TOO_MANY_ATTEMPTS", "Too many reset emails. Try again later.")
+
+    user = await repo.get_user_by_email(db, email)
+    if user is None:
+        # Pretend the email was sent: an unknown address is not disclosed.
+        return _reset_expires_in(settings), settings.email_code_resend_cooldown_seconds
+
+    await store.set(
+        _RESET_COOLDOWN_KEY.format(email=email),
+        "1",
+        settings.email_code_resend_cooldown_seconds,
+    )
+
+    token = secrets.token_urlsafe(32)
+    await repo.create_password_reset_token(
+        db,
+        user_id=user.id,
+        token_digest=sha256_hex(token),
+        expires_at=_now() + timedelta(minutes=settings.password_reset_ttl_minutes),
+    )
+    await provider.send_password_reset(email=user.email, token=token)
+    logger.info("password reset requested for user %s", user.id)
+    return _reset_expires_in(settings), settings.email_code_resend_cooldown_seconds
+
+
+async def reset_password(
+    db: AsyncSession,
+    *,
+    email: str,
+    token: str,
+    new_password: str,
+    ip_address: str | None,
+) -> User:
+    email = normalize_email(email)
+    user = await repo.get_user_by_email(db, email)
+    row = await repo.get_latest_password_reset_token(db, user.id) if user is not None else None
+    if user is None or row is None or row.used_at is not None:
+        # Unknown address, missing row, and spent token share one generic
+        # error so none of them is distinguishable.
+        raise ApiError(400, "INVALID_RESET_TOKEN", "Invalid or expired reset token")
+
+    now = _now()
+    if _ensure_utc(row.expires_at) < now:
+        raise ApiError(400, "RESET_TOKEN_EXPIRED", "Reset token has expired")
+
+    if not constant_time_eq(row.token_digest, sha256_hex(token)):
+        raise ApiError(400, "INVALID_RESET_TOKEN", "Invalid or expired reset token")
+
+    if user.status != UserStatus.ACTIVE:
+        raise ApiError(400, "INVALID_RESET_TOKEN", "Invalid or expired reset token")
+
+    user.password_hash = hash_password(new_password)
+    consumed = await repo.mark_password_reset_token_used(db, row.id, now)
+    if consumed == 0:
+        # Lost a race with a concurrent confirm of the same token: the token
+        # is now spent, so the request is a reuse.
+        raise ApiError(400, "INVALID_RESET_TOKEN", "Invalid or expired reset token")
+
+    # Sessions minted under the old password die with it.
+    await repo.revoke_all_user_sessions(db, user.id, now)
+    await repo.add_audit_entry(
+        db,
+        actor_user_id=user.id,
+        entity_type="user",
+        entity_id=user.id,
+        action="auth.password_reset",
+        ip_address=ip_address,
+    )
+    logger.info("password reset for user %s", user.id)
+    return user

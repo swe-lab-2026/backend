@@ -14,6 +14,9 @@ class EmailProvider(Protocol):
     async def send_verification_code(self, *, email: str, code: str, locale: str = "en") -> None:
         ...
 
+    async def send_password_reset(self, *, email: str, token: str, locale: str = "en") -> None:
+        ...
+
 
 class DevEmailProvider:
     """Safe development implementation: logs the code and never reaches a mail server.
@@ -25,6 +28,7 @@ class DevEmailProvider:
 
     def __init__(self) -> None:
         self._last_codes: dict[str, str] = {}
+        self._last_reset_tokens: dict[str, str] = {}
 
     async def send_verification_code(self, *, email: str, code: str, locale: str = "en") -> None:
         self._last_codes[email] = code
@@ -32,6 +36,16 @@ class DevEmailProvider:
 
     def last_code_for(self, email: str) -> str | None:
         return self._last_codes.get(email)
+
+    async def send_password_reset(self, *, email: str, token: str, locale: str = "en") -> None:
+        self._last_reset_tokens[email] = token
+        # The raw token is deliberately never logged: unlike a short-lived
+        # verification code it is a bearer credential, and production logs
+        # must not contain it either.
+        logger.info("password reset token issued for %s", email)
+
+    def last_reset_token_for(self, email: str) -> str | None:
+        return self._last_reset_tokens.get(email)
 
 
 def build_email_provider() -> EmailProvider:

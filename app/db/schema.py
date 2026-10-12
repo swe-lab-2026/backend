@@ -1,13 +1,27 @@
 import logging
+from pathlib import Path
 
 import anyio
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.config import Settings
 from app.db.models import Base
 
 logger = logging.getLogger("app.db")
+
+# Session-level advisory-lock key serializing concurrent migration runners.
+_MIGRATION_LOCK = "biletflow_schema_migrations"
+
+# Baselines that predate the versioned runner. The old bootstrapper executed
+# its files in one transaction without recording anything, so a database that
+# already contains these tables must have them in full; the versions below are
+# then recorded without re-executing (migrate_001 is not safely re-runnable).
+# Each rule is (version, tables that must all exist).
+_BASELINE_RULES: tuple[tuple[str, frozenset[str]], ...] = (
+    ("migrate_001.sql", frozenset({"users"})),
+    ("migrate_002_auth.sql", frozenset({"refresh_sessions", "email_verification_tokens"})),
+)
 
 
 def _split_statements(sql: str) -> list[str]:
@@ -85,30 +99,122 @@ def _split_statements(sql: str) -> list[str]:
     return statements
 
 
+def _tracking_table_ddl(dialect_name: str) -> str:
+    if dialect_name == "postgresql":
+        return (
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "version VARCHAR(255) PRIMARY KEY, "
+            "applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+        )
+    return (
+        "CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(255) PRIMARY KEY, "
+        "applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
+
+
+async def _recorded_versions(engine: AsyncEngine) -> set[str]:
+    async with engine.connect() as conn:
+        rows = await conn.execute(text("SELECT version FROM schema_migrations"))
+        return set(rows.scalars().all())
+
+
+async def _backfill_baseline(engine: AsyncEngine, versions: list[str]) -> list[str]:
+    """Record pre-runner baselines without executing them.
+
+    Only versions from the configured file list that are not yet recorded are
+    considered, and only when every marker table for the rule already exists.
+    Returns the versions that were recorded.
+    """
+    async with engine.connect() as conn:
+        tables = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
+
+    recorded = await _recorded_versions(engine)
+    to_mark = [
+        version
+        for version, markers in _BASELINE_RULES
+        if version in versions and version not in recorded and markers <= tables
+    ]
+    if not to_mark:
+        return []
+    async with engine.begin() as conn:
+        for version in to_mark:
+            await conn.execute(
+                text("INSERT INTO schema_migrations (version) VALUES (:version)"),
+                {"version": version},
+            )
+    logger.info("migrations backfilled without execution: %s", ", ".join(to_mark))
+    return to_mark
+
+
+async def apply_migration_files(engine: AsyncEngine, files: list[str]) -> list[str]:
+    """Apply pending migration files exactly once, in the given order.
+
+    Each file runs in its own transaction and its version (the file name) is
+    recorded in ``schema_migrations`` only after the file completes. A failed
+    file rolls back, is not recorded, and aborts the run so the failure is
+    visible instead of silently skipped. On PostgreSQL the whole run holds a
+    session-level advisory lock, so concurrent runners serialize and the
+    second one becomes a no-op. Returns the versions applied by this call.
+    """
+    versions = [Path(schema_file).name for schema_file in files]
+    is_postgres = engine.dialect.name == "postgresql"
+
+    async def _run() -> list[str]:
+        async with engine.begin() as conn:
+            await conn.exec_driver_sql(_tracking_table_ddl(engine.dialect.name))
+        recorded = await _recorded_versions(engine)
+        recorded.update(await _backfill_baseline(engine, versions))
+
+        applied: list[str] = []
+        for schema_file, version in zip(files, versions, strict=True):
+            if version in recorded:
+                continue
+            sql = await anyio.Path(schema_file).read_text(encoding="utf-8")
+            async with engine.begin() as conn:
+                for statement in _split_statements(sql):
+                    await conn.exec_driver_sql(statement)
+                await conn.execute(
+                    text("INSERT INTO schema_migrations (version) VALUES (:version)"),
+                    {"version": version},
+                )
+            recorded.add(version)
+            applied.append(version)
+            logger.info("migration applied: %s", version)
+        return applied
+
+    if not is_postgres:
+        return await _run()
+
+    async with engine.connect() as lock_conn:
+        await lock_conn.exec_driver_sql(f"SELECT pg_advisory_lock(hashtext('{_MIGRATION_LOCK}'))")
+        try:
+            return await _run()
+        finally:
+            await lock_conn.exec_driver_sql(
+                f"SELECT pg_advisory_unlock(hashtext('{_MIGRATION_LOCK}'))"
+            )
+
+
 async def apply_schema(engine: AsyncEngine, settings: Settings) -> None:
     """Idempotently apply the persisted schema.
 
-    Postgres runs the checked-in SQL migrations (the same contract the
-    frontend repo keeps); other dialects (tests) fall back to the SQLAlchemy
-    metadata, which mirrors the same tables.
-
-    migrate_001.sql is a baseline that targets an empty database; its enum
-    types and trigger function are guarded so it can run repeatedly. The whole
-    file is skipped once the `users` table exists (startup on a populated
-    database).
+    Postgres runs the checked-in SQL migrations through the versioned runner:
+    every file executes exactly once, in ``schema_files`` order, with applied
+    versions tracked in ``schema_migrations``. Databases bootstrapped by the
+    previous untracked mechanism are detected via their tables and have the
+    baseline versions recorded without re-execution, so existing state stays
+    intact. Other dialects (tests) fall back to the SQLAlchemy metadata, which
+    mirrors the same tables.
     """
     if not settings.apply_schema_on_startup:
         return
 
     if engine.dialect.name == "postgresql":
-        async with engine.begin() as conn:
-            has_users = await conn.run_sync(lambda sync_conn: inspect(sync_conn).has_table("users"))
-            files = [] if has_users else settings.schema_files
-            for schema_file in files:
-                sql = await anyio.Path(schema_file).read_text(encoding="utf-8")
-                for statement in _split_statements(sql):
-                    await conn.exec_driver_sql(statement)
-        logger.info("schema applied from %s", ", ".join(files) or "none (already bootstrapped)")
+        applied = await apply_migration_files(engine, settings.schema_files)
+        logger.info(
+            "schema migrations applied: %s",
+            ", ".join(applied) if applied else "none (already up to date)",
+        )
     else:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
