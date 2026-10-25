@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -8,7 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api.routes import admin, auth, events, organizers, users
+from app.api.routes import admin, auth, events, organizers, users, orders
 from app.core.config import Settings, get_settings
 from app.core.errors import (
     ApiError,
@@ -53,10 +54,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.redis = redis
         app.state.email_provider = email_provider
 
+        async def cleanup_expired_inventory() -> None:
+            from app.services.orders import expire_holds
+            while True:
+                try:
+                    async with session_factory() as db:
+                        await expire_holds(db)
+                        await db.commit()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Failed to expire inventory holds")
+                await asyncio.sleep(30)
+
+        cleanup_task = asyncio.create_task(cleanup_expired_inventory())
         logger.info("%s started (env=%s)", settings.app_name, settings.app_env)
         try:
             yield
         finally:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
             await store.aclose()
             await engine.dispose()
 
@@ -90,6 +110,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(admin.router, prefix=settings.api_prefix)
     app.include_router(organizers.router, prefix=settings.api_prefix)
     app.include_router(events.router, prefix=settings.api_prefix)
+    app.include_router(orders.router, prefix=settings.api_prefix)
 
     @app.get("/")
     async def root() -> dict[str, str]:

@@ -1,6 +1,7 @@
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
@@ -9,7 +10,7 @@ from app.api.deps import (
     require_active_user,
     require_event_owner,
 )
-from app.db.models import Event, User
+from app.db.models import Attendee, Event, Order, OrderItem, OrderStatus, User
 from app.schemas.event_staff import (
     AssignedEventResponse,
     EventAdminAssignRequest,
@@ -71,3 +72,30 @@ async def remove_event_admin(
     db: AsyncSession = Depends(get_db),
 ) -> None:
     await service.remove_event_admin(db, actor, event, user_id=user_id)
+
+@router.get("/{event_id}/attendees")
+async def list_event_attendees(
+    event: Event = Depends(require_event_owner),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    """List attendees attached to confirmed (PAID, including free) orders."""
+    stmt = (
+        select(Attendee, OrderItem, Order)
+        .join(OrderItem, OrderItem.attendee_id == Attendee.id)
+        .join(Order, Order.id == OrderItem.order_id)
+        .where(Order.event_id == event.id, Order.status == OrderStatus.PAID)
+        .order_by(Attendee.created_at.desc())
+    )
+    rows = (await db.execute(stmt)).all()
+    return [
+        {
+            "attendee_id": str(attendee.id),
+            "full_name": attendee.full_name,
+            "email": attendee.email,
+            "phone": attendee.phone,
+            "order_id": str(order.id),
+            "ticket_type_id": str(item.ticket_type_id),
+            "ticket_type_name": item.ticket_type_name,
+        }
+        for attendee, item, order in rows
+    ]
