@@ -6,6 +6,7 @@ from sqlalchemy import CursorResult, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
+    Attendee,
     AuditLog,
     EmailVerificationToken,
     Event,
@@ -18,6 +19,7 @@ from app.db.models import (
     InventoryHold,
     Order,
     OrderItem,
+    OrderNotification,
     OrderStatus,
     OrganizerProfile,
     PasswordResetToken,
@@ -28,6 +30,10 @@ from app.db.models import (
     TicketType,
     User,
 )
+
+# Orders in these states have committed inventory and may own admission
+# tickets. CONFIRMED is used for free registration; PAID for paid checkouts.
+COMMITTED_ORDER_STATUSES = (OrderStatus.PAID, OrderStatus.CONFIRMED)
 
 
 def _now() -> datetime:
@@ -478,7 +484,7 @@ async def count_sold_items(
         .join(Order, Order.id == OrderItem.order_id)
         .where(
             OrderItem.ticket_type_id == ticket_type_id,
-            Order.status == OrderStatus.PAID,
+            Order.status.in_(COMMITTED_ORDER_STATUSES),
         )
     )
     return int(result.scalar_one())
@@ -489,7 +495,7 @@ async def count_event_sold_items(session: AsyncSession, event_id: UUID) -> int:
         select(func.count())
         .select_from(OrderItem)
         .join(Order, Order.id == OrderItem.order_id)
-        .where(Order.event_id == event_id, Order.status == OrderStatus.PAID)
+        .where(Order.event_id == event_id, Order.status.in_(COMMITTED_ORDER_STATUSES))
     )
     return int(result.scalar_one())
 
@@ -504,6 +510,198 @@ async def count_tickets_by_status(
         .where(OrderItem.ticket_type_id == ticket_type_id, Ticket.status == status)
     )
     return int(result.scalar_one())
+
+
+# ---------- Orders, tickets, attendees, notifications ----------
+
+async def get_order_by_id(session: AsyncSession, order_id: UUID) -> Order | None:
+    return await session.get(Order, order_id)
+
+
+async def get_order_for_update(session: AsyncSession, order_id: UUID) -> Order | None:
+    result = await session.execute(
+        select(Order).where(Order.id == order_id).with_for_update()
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_user_orders(
+    session: AsyncSession, buyer_user_id: UUID, *, limit: int = 50, offset: int = 0
+) -> list[Order]:
+    result = await session.execute(
+        select(Order)
+        .where(Order.buyer_user_id == buyer_user_id)
+        .order_by(Order.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    return list(result.scalars().all())
+
+
+async def list_order_holds(session: AsyncSession, order_id: UUID) -> list[InventoryHold]:
+    result = await session.execute(
+        select(InventoryHold).where(InventoryHold.order_id == order_id)
+    )
+    return list(result.scalars().all())
+
+
+async def list_expired_pending_orders(
+    session: AsyncSession, *, now: datetime, limit: int = 100
+) -> list[Order]:
+    result = await session.execute(
+        select(Order)
+        .where(
+            Order.status == OrderStatus.PENDING,
+            Order.expires_at.is_not(None),
+            Order.expires_at <= now,
+        )
+        .order_by(Order.expires_at.asc())
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    return list(result.scalars().all())
+
+
+async def list_order_items(session: AsyncSession, order_id: UUID) -> list[OrderItem]:
+    result = await session.execute(
+        select(OrderItem)
+        .where(OrderItem.order_id == order_id)
+        .order_by(OrderItem.created_at.asc(), OrderItem.id.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def list_order_tickets(session: AsyncSession, order_id: UUID) -> list[Ticket]:
+    result = await session.execute(
+        select(Ticket)
+        .join(OrderItem, OrderItem.id == Ticket.order_item_id)
+        .where(OrderItem.order_id == order_id)
+        .order_by(Ticket.issued_at.asc(), Ticket.id.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def get_ticket_by_public_id(
+    session: AsyncSession, public_id: UUID
+) -> Ticket | None:
+    result = await session.execute(
+        select(Ticket).where(Ticket.public_id == public_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_ticket_by_qr_hash(
+    session: AsyncSession, qr_token_hash: str
+) -> Ticket | None:
+    result = await session.execute(
+        select(Ticket).where(Ticket.qr_token_hash == qr_token_hash)
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_user_tickets(
+    session: AsyncSession, buyer_user_id: UUID, *, limit: int = 200, offset: int = 0
+) -> list[Ticket]:
+    result = await session.execute(
+        select(Ticket)
+        .join(OrderItem, OrderItem.id == Ticket.order_item_id)
+        .join(Order, Order.id == OrderItem.order_id)
+        .where(Order.buyer_user_id == buyer_user_id)
+        .order_by(Ticket.issued_at.desc(), Ticket.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    return list(result.scalars().all())
+
+
+async def get_ticket_for_update(
+    session: AsyncSession, public_id: UUID
+) -> Ticket | None:
+    result = await session.execute(
+        select(Ticket).where(Ticket.public_id == public_id).with_for_update()
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_ticket_order_item(
+    session: AsyncSession, ticket: Ticket
+) -> tuple[OrderItem, Order, Event, TicketType] | None:
+    result = await session.execute(
+        select(OrderItem, Order, Event, TicketType)
+        .join(Order, Order.id == OrderItem.order_id)
+        .join(Event, Event.id == Order.event_id)
+        .join(TicketType, TicketType.id == OrderItem.ticket_type_id)
+        .where(OrderItem.id == ticket.order_item_id)
+    )
+    row = result.first()
+    if row is None:
+        return None
+    return row[0], row[1], row[2], row[3]
+
+
+async def get_attendee(session: AsyncSession, attendee_id: UUID) -> Attendee | None:
+    return await session.get(Attendee, attendee_id)
+
+
+async def create_attendee(
+    session: AsyncSession,
+    *,
+    user_id: UUID | None,
+    full_name: str,
+    email: str,
+    phone: str | None,
+) -> Attendee:
+    attendee = Attendee(
+        user_id=user_id,
+        full_name=full_name,
+        email=email,
+        phone=phone,
+    )
+    session.add(attendee)
+    await session.flush()
+    return attendee
+
+
+async def get_order_notification(
+    session: AsyncSession,
+    *,
+    order_id: UUID,
+    kind: str,
+    for_update: bool = False,
+) -> OrderNotification | None:
+    stmt = select(OrderNotification).where(
+        OrderNotification.order_id == order_id,
+        OrderNotification.kind == kind,
+    )
+    if for_update:
+        stmt = stmt.with_for_update()
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def create_order_notification(
+    session: AsyncSession, *, order_id: UUID, kind: str
+) -> OrderNotification:
+    notification = OrderNotification(order_id=order_id, kind=kind)
+    session.add(notification)
+    await session.flush()
+    return notification
+
+
+async def list_retryable_order_notifications(
+    session: AsyncSession, *, max_attempts: int, limit: int = 100
+) -> list[OrderNotification]:
+    result = await session.execute(
+        select(OrderNotification)
+        .where(
+            OrderNotification.status.in_(("PENDING", "FAILED")),
+            OrderNotification.attempts < max_attempts,
+        )
+        .order_by(OrderNotification.created_at.asc())
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    return list(result.scalars().all())
 
 
 # ---------- Event staff ----------

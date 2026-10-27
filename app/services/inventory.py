@@ -1,24 +1,17 @@
-import hashlib
 import logging
-import secrets
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
 from app.core.errors import ApiError
 from app.db import repositories as repo
 from app.db.models import (
-    Attendee,
     Event,
     EventStatus,
     HoldStatus,
     InventoryHold,
-    Order,
-    OrderItem,
-    OrderStatus,
-    Ticket,
     TicketStatus,
     TicketType,
     User,
@@ -40,10 +33,6 @@ DEFAULT_HOLD_TTL_MINUTES = 10
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _qr_token_hash() -> str:
-    return hashlib.sha256(secrets.token_urlsafe(32).encode("utf-8")).hexdigest()
 
 
 async def get_event_inventory(db: AsyncSession, event: Event) -> EventInventoryResponse:
@@ -190,115 +179,72 @@ async def purchase(
     event_id: UUID,
     ticket_type_id: UUID,
     payload: PurchaseRequest,
+    *,
+    settings: Settings | None = None,
 ) -> PurchaseResponse:
-    quantity = payload.quantity
+    """Legacy single-ticket-type checkout.
+
+    Kept for backwards compatibility; it delegates to the order service so
+    free registrations, QR credentials, attendees and confirmation emails
+    behave exactly like multi-item ``POST /orders``.
+    """
+    from app.core.config import get_settings
+    from app.schemas.orders import OrderCreate, OrderItemCreate
+    from app.services import orders as order_service
+
     event, ticket_type = await _lock_event_and_type(db, event_id, ticket_type_id)
     now = _now()
     _validate_saleable(event, ticket_type, now)
-    await _check_availability(db, event, ticket_type, quantity, now)
+    await _check_availability(db, event, ticket_type, payload.quantity, now)
 
-    is_free = ticket_type.price == 0
-    unit_price = ticket_type.price
-    total_amount = unit_price * quantity
-
-    expires_at = None if is_free else now + timedelta(minutes=DEFAULT_HOLD_TTL_MINUTES)
-    order = Order(
-        event_id=event.id,
-        buyer_user_id=user.id,
-        buyer_email=user.email,
-        status=OrderStatus.PAID if is_free else OrderStatus.PENDING,
-        currency="KZT" if is_free else ticket_type.currency,
-        subtotal_amount=total_amount,
-        discount_amount=Decimal("0.00"),
-        fee_amount=Decimal("0.00"),
-        total_amount=total_amount,
-        expires_at=expires_at,
-        paid_at=now if is_free else None,
-    )
-    db.add(order)
-    await db.flush()
-
-    attendee = Attendee(
-        user_id=user.id,
-        full_name=f"{user.first_name} {user.last_name}".strip(),
-        email=user.email,
-        phone=user.phone,
-    )
-    db.add(attendee)
-    await db.flush()
-
-    tickets: list[TicketItemResponse] = []
-    for _ in range(quantity):
-        item = OrderItem(
-            order_id=order.id,
-            ticket_type_id=ticket_type.id,
-            attendee_id=attendee.id,
-            ticket_type_name=ticket_type.name,
-            unit_price=unit_price,
-            discount_amount=Decimal("0.00"),
-            final_price=unit_price,
-        )
-        db.add(item)
-        await db.flush()
-
-        if is_free:
-            ticket = Ticket(order_item_id=item.id, qr_token_hash=_qr_token_hash())
-            db.add(ticket)
-            await db.flush()
-            tickets.append(
-                TicketItemResponse(
-                    ticket_id=ticket.id,
-                    public_id=ticket.public_id,
-                    status=ticket.status.value,
-                    issued_at=ticket.issued_at,
+    settings = settings or get_settings()
+    order = await order_service.create_order(
+        db,
+        user,
+        OrderCreate(
+            event_id=event_id,
+            items=[
+                OrderItemCreate(
+                    ticket_type_id=ticket_type_id, quantity=payload.quantity
                 )
+            ],
+        ),
+        qr_secret=settings.effective_ticket_qr_secret,
+        reservation_ttl_minutes=settings.order_reservation_ttl_minutes,
+    )
+
+    order_tickets = await repo.list_order_tickets(db, order.id)
+    tickets = [
+        TicketItemResponse(
+            ticket_id=ticket.id,
+            public_id=ticket.public_id,
+            status=ticket.status.value,
+            issued_at=ticket.issued_at,
+        )
+        for ticket in order_tickets
+    ]
+    hold: HoldResponse | None = None
+    if order.total_amount > 0:
+        order_holds = await repo.list_order_holds(db, order.id)
+        if order_holds:
+            inventory_hold = order_holds[0]
+            hold = HoldResponse(
+                hold_id=inventory_hold.id,
+                event_id=inventory_hold.event_id,
+                ticket_type_id=inventory_hold.ticket_type_id,
+                quantity=inventory_hold.quantity,
+                status=inventory_hold.status.value,
+                expires_at=inventory_hold.expires_at,
+                created_at=inventory_hold.created_at,
             )
 
-    hold: HoldResponse | None = None
-    if not is_free:
-        assert expires_at is not None
-        inventory_hold = InventoryHold(
-            event_id=event.id,
-            ticket_type_id=ticket_type.id,
-            user_id=user.id,
-            order_id=order.id,
-            quantity=quantity,
-            status=HoldStatus.ACTIVE,
-            expires_at=expires_at,
-        )
-        db.add(inventory_hold)
-        await db.flush()
-        hold = HoldResponse(
-            hold_id=inventory_hold.id,
-            event_id=event.id,
-            ticket_type_id=ticket_type.id,
-            quantity=inventory_hold.quantity,
-            status=inventory_hold.status.value,
-            expires_at=inventory_hold.expires_at,
-            created_at=inventory_hold.created_at,
-        )
-
-    await repo.add_audit_entry(
-        db,
-        actor_user_id=user.id,
-        event_id=event.id,
-        entity_type="order",
-        entity_id=order.id,
-        action="order.created",
-        after_data={
-            "status": order.status.value,
-            "total_amount": str(order.total_amount),
-            "is_free": is_free,
-        },
-    )
-    logger.info("order %s created for event %s by %s", order.id, event.id, user.id)
     return PurchaseResponse(
         order_id=order.id,
         order_number=order.order_number,
         status=order.status.value,
         currency=order.currency,
         total_amount=order.total_amount,
-        is_free=is_free,
+        is_free=order.total_amount == 0,
         tickets=tickets,
         hold=hold,
     )

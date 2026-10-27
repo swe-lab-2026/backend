@@ -22,10 +22,12 @@ from sqlalchemy import (
     SmallInteger,
     String,
     Text,
+    TypeDecorator,
     UniqueConstraint,
     text,
 )
 from sqlalchemy.dialects.postgresql import CITEXT, INET, JSONB
+from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -71,7 +73,37 @@ def _next_order_number() -> int:
 CitextType = String().with_variant(CITEXT(), "postgresql")
 JsonType = JSON().with_variant(JSONB(), "postgresql")
 InetType = String().with_variant(INET(), "postgresql")
-TimestampTz = DateTime(timezone=True)
+class UTCDateTime(TypeDecorator[datetime]):
+    """Store UTC timestamps and always return timezone-aware datetimes.
+
+    SQLite discards timezone information for ``DateTime(timezone=True)``;
+    normalizing on the way out keeps comparisons consistent across SQLite and
+    PostgreSQL.
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(
+        self, value: datetime | None, dialect: Dialect
+    ) -> datetime | None:
+        del dialect
+        if value is None:
+            return None
+        return value.astimezone(timezone.utc)
+
+    def process_result_value(
+        self, value: datetime | None, dialect: Dialect
+    ) -> datetime | None:
+        del dialect
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+
+TimestampTz = UTCDateTime()
 
 
 # ---------- Enums ----------
@@ -131,6 +163,10 @@ class PaidSalesStatus(PyEnum):
 class OrderStatus(PyEnum):
     PENDING = "PENDING"
     PAID = "PAID"
+    # Free registrations are confirmed without a payment step. PAID remains
+    # the committed state for paid checkouts, so both are treated as confirmed
+    # when issuing admission tickets.
+    CONFIRMED = "CONFIRMED"
     CANCELLED = "CANCELLED"
     EXPIRED = "EXPIRED"
     PARTIALLY_REFUNDED = "PARTIALLY_REFUNDED"
@@ -633,6 +669,45 @@ class Order(Base):
         ),
         Index("idx_orders_buyer", "buyer_user_id", text("created_at DESC")),
         Index("idx_orders_event_status", "event_id", "status", text("created_at DESC")),
+    )
+
+
+class OrderNotification(Base):
+    """Transactional outbox for post-confirmation ticket emails.
+
+    The unique (order_id, kind) constraint makes enqueueing idempotent, while
+    the status/attempts columns let a retry worker deliver after transient
+    provider failures without ever issuing additional tickets.
+    """
+
+    __tablename__ = "order_notifications"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    order_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("orders.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="ORDER_CONFIRMATION"
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    sent_at: Mapped[datetime | None] = mapped_column(TimestampTz)
+    created_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PENDING', 'SENT', 'FAILED')",
+            name="order_notifications_status_valid",
+        ),
+        UniqueConstraint("order_id", "kind", name="uq_order_notifications_order_kind"),
+        Index(
+            "idx_order_notifications_pending",
+            "status",
+            "created_at",
+            postgresql_where=text("status IN ('PENDING', 'FAILED')"),
+        ),
     )
 
 

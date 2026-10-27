@@ -14,7 +14,7 @@ WORKDIR /app
 # `npx`, which would download a compiler at request time — on a machine that is
 # about to run it against a stranger's repository.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git nodejs npm ca-certificates \
+    && apt-get install -y --no-install-recommends git nodejs npm ca-certificates fonts-dejavu-core \
     && npm install -g esbuild@0.25.0 \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/*

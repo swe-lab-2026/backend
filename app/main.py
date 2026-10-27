@@ -1,7 +1,7 @@
-import logging
 import asyncio
+import logging
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import redis.asyncio as redis_async
 from fastapi import FastAPI
@@ -9,7 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api.routes import admin, auth, events, organizers, users, orders
+from app.api.routes import admin, auth, events, orders, organizers, tickets, users
 from app.core.config import Settings, get_settings
 from app.core.errors import (
     ApiError,
@@ -22,6 +22,8 @@ from app.core.logging import RequestContextMiddleware, configure_logging
 from app.db.schema import apply_schema
 from app.db.session import create_engine_and_session_factory
 from app.kv.store import MemoryTTLStore, RedisTTLStore, TTLStore
+from app.services import notifications
+from app.services import orders as order_service
 from app.services.email import EmailProvider, build_email_provider
 
 logger = logging.getLogger("app")
@@ -54,29 +56,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.redis = redis
         app.state.email_provider = email_provider
 
-        async def cleanup_expired_inventory() -> None:
-            from app.services.orders import expire_holds
+        async def reservation_loop() -> None:
             while True:
+                await asyncio.sleep(settings.reservation_cleanup_interval_seconds)
                 try:
-                    async with session_factory() as db:
-                        await expire_holds(db)
-                        await db.commit()
+                    async with session_factory() as session:
+                        await order_service.expire_holds(session)
+                        await session.commit()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    logger.exception("Failed to expire inventory holds")
-                await asyncio.sleep(30)
+                    logger.exception("reservation cleanup failed")
 
-        cleanup_task = asyncio.create_task(cleanup_expired_inventory())
+        async def notification_loop() -> None:
+            while True:
+                await asyncio.sleep(settings.notification_retry_interval_seconds)
+                try:
+                    async with session_factory() as session:
+                        await notifications.process_pending_notifications(
+                            session,
+                            provider=email_provider,
+                            download_base=settings.public_api_base,
+                            max_attempts=settings.notification_max_attempts,
+                        )
+                        await session.commit()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("notification retry failed")
+
+        background_tasks: list[asyncio.Task[None]] = []
+        if settings.app_env != "test":
+            if settings.reservation_cleanup_enabled:
+                background_tasks.append(asyncio.create_task(reservation_loop()))
+            background_tasks.append(asyncio.create_task(notification_loop()))
+
         logger.info("%s started (env=%s)", settings.app_name, settings.app_env)
         try:
             yield
         finally:
-            cleanup_task.cancel()
-            try:
-                await cleanup_task
-            except asyncio.CancelledError:
-                pass
+            for task in background_tasks:
+                task.cancel()
+            for task in background_tasks:
+                with suppress(asyncio.CancelledError):
+                    await task
             await store.aclose()
             await engine.dispose()
 
@@ -111,6 +134,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(organizers.router, prefix=settings.api_prefix)
     app.include_router(events.router, prefix=settings.api_prefix)
     app.include_router(orders.router, prefix=settings.api_prefix)
+    app.include_router(tickets.router, prefix=settings.api_prefix)
+    app.include_router(tickets.checkin_router, prefix=settings.api_prefix)
 
     @app.get("/")
     async def root() -> dict[str, str]:
