@@ -1,6 +1,7 @@
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
@@ -33,9 +34,11 @@ from app.schemas.events import (
     TicketTypeResponse,
     TicketTypeUpdate,
 )
+from app.schemas.orders import EventAttendeeResponse
 from app.services import event_staff as staff_service
 from app.services import events as service
 from app.services import inventory as inventory_service
+from app.services import orders as order_service
 from app.services import ticket_types as ticket_type_service
 
 router = APIRouter(prefix="/events", tags=["events"])
@@ -356,6 +359,24 @@ async def hide_ticket_type(
 ) -> None:
     ticket_type = await ticket_type_service.get_ticket_type(db, event, ticket_type_id)
     await ticket_type_service.hide_ticket_type(db, actor, event, ticket_type)
+
+
+# ---------- Confirmed attendees ----------
+
+
+@router.get("/{event_id}/attendees", response_model=list[EventAttendeeResponse])
+async def list_event_attendees(
+    event_id: UUID,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    event: Event = Depends(require_event_owner),
+    db: AsyncSession = Depends(get_db),
+) -> list[EventAttendeeResponse]:
+    """Return attendees only for confirmed (PAID) orders owned by this organizer."""
+    rows = await order_service.list_event_attendees(
+        db, event.id, limit=limit, offset=offset
+    )
+    return [EventAttendeeResponse(**row) for row in rows]
 
 
 # ---------- Inventory ----------
