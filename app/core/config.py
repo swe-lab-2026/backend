@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     # is used so existing deployments keep working after an upgrade.
     ticket_qr_secret: str = Field(default="")
     public_base_url: str = ""
-    order_reservation_ttl_minutes: int = Field(default=15, ge=1, le=1440)
+    order_reservation_ttl_minutes: int = Field(default=10, ge=1, le=1440)
     reservation_cleanup_interval_seconds: int = Field(default=60, ge=1, le=3600)
     reservation_cleanup_enabled: bool = True
     notification_retry_interval_seconds: int = Field(default=60, ge=1, le=3600)

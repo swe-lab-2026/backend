@@ -22,10 +22,12 @@ from sqlalchemy import (
     SmallInteger,
     String,
     Text,
+    TypeDecorator,
     UniqueConstraint,
     text,
 )
 from sqlalchemy.dialects.postgresql import CITEXT, INET, JSONB
+from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -71,7 +73,37 @@ def _next_order_number() -> int:
 CitextType = String().with_variant(CITEXT(), "postgresql")
 JsonType = JSON().with_variant(JSONB(), "postgresql")
 InetType = String().with_variant(INET(), "postgresql")
-TimestampTz = DateTime(timezone=True)
+class UTCDateTime(TypeDecorator[datetime]):
+    """Store UTC timestamps and always return timezone-aware datetimes.
+
+    SQLite discards timezone information for ``DateTime(timezone=True)``;
+    normalizing on the way out keeps comparisons consistent across SQLite and
+    PostgreSQL.
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(
+        self, value: datetime | None, dialect: Dialect
+    ) -> datetime | None:
+        del dialect
+        if value is None:
+            return None
+        return value.astimezone(timezone.utc)
+
+    def process_result_value(
+        self, value: datetime | None, dialect: Dialect
+    ) -> datetime | None:
+        del dialect
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+
+TimestampTz = UTCDateTime()
 
 
 # ---------- Enums ----------

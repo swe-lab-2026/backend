@@ -2,28 +2,23 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.tickets import TicketResponse
 
 
-class OrderItemCreate(BaseModel):
+class OrderItemRequest(BaseModel):
     ticket_type_id: UUID
-    quantity: int = Field(gt=0, le=1000)
+    quantity: int = Field(ge=1, le=100)
 
 
-class OrderCreate(BaseModel):
+class OrderCreateRequest(BaseModel):
     event_id: UUID
-    items: list[OrderItemCreate] = Field(min_length=1, max_length=50)
+    items: list[OrderItemRequest] = Field(min_length=1, max_length=20)
 
-    @model_validator(mode="after")
-    def _unique_ticket_types(self) -> "OrderCreate":
-        seen: set[UUID] = set()
-        for item in self.items:
-            if item.ticket_type_id in seen:
-                raise ValueError("each ticket type may appear only once per order")
-            seen.add(item.ticket_type_id)
-        return self
+
+OrderItemCreate = OrderItemRequest
+OrderCreate = OrderCreateRequest
 
 
 class OrderItemResponse(BaseModel):
@@ -32,9 +27,12 @@ class OrderItemResponse(BaseModel):
     quantity: int
     unit_price: Decimal
     subtotal: Decimal
+    final_price: Decimal
 
 
 class OrderResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: UUID
     order_id: UUID
     order_number: int
@@ -55,3 +53,19 @@ class OrderResponse(BaseModel):
     updated_at: datetime
     items: list[OrderItemResponse]
     tickets: list[TicketResponse]
+
+
+class EventAttendeeResponse(BaseModel):
+    """A unique attendee attached to a confirmed order."""
+
+    attendee_id: UUID
+    user_id: UUID | None
+    full_name: str
+    email: str
+    phone: str | None
+    registered_at: datetime
+    order_id: UUID
+    order_number: int
+    currency: str
+    total_amount: Decimal
+    ticket_count: int

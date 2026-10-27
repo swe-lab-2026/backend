@@ -79,7 +79,7 @@ async def test_free_order_issues_tickets_pdf_and_one_email(client, app, db):
     )
     assert response.status_code == 201, response.text
     body = response.json()
-    assert body["status"] == "CONFIRMED"
+    assert body["status"] == "PAID"
     assert body["is_free"] is True
     assert len(body["tickets"]) == 2
     payloads = {ticket["qr_payload"] for ticket in body["tickets"]}
@@ -283,7 +283,7 @@ async def test_legacy_purchase_endpoint_issues_signed_tickets_and_email(client, 
         headers=bearer(buyer_token),
     )
     assert purchase.status_code == 201, purchase.text
-    assert purchase.json()["status"] == "CONFIRMED"
+    assert purchase.json()["status"] == "PAID"
     public_id = purchase.json()["tickets"][0]["public_id"]
 
     ticket = await client.get(f"{API}/tickets/{public_id}", headers=bearer(buyer_token))

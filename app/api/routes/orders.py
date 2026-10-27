@@ -5,9 +5,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
     get_app_settings,
-    get_current_user,
     get_db,
     get_email_provider,
+    require_active_user,
 )
 from app.core.config import Settings
 from app.db import repositories as repo
@@ -53,7 +53,7 @@ async def _deliver_email(
 @router.post("", response_model=OrderResponse, status_code=201)
 async def create_order(
     payload: OrderCreate,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_active_user),
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
     provider: EmailProvider = Depends(get_email_provider),
@@ -74,20 +74,18 @@ async def create_order(
 async def list_orders(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_active_user),
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
 ) -> list[OrderResponse]:
-    orders = await repo.list_user_orders(
-        db, user.id, limit=limit, offset=offset
-    )
+    orders = await repo.list_user_orders(db, user.id, limit=limit, offset=offset)
     return [await _response(db, order, settings) for order in orders]
 
 
 @router.get("/{order_id}/tickets", response_model=list[TicketResponse])
 async def list_order_tickets(
     order_id: UUID,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_active_user),
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
 ) -> list[TicketResponse]:
@@ -104,18 +102,19 @@ async def list_order_tickets(
 @router.get("/{order_id}", response_model=OrderResponse)
 async def get_order(
     order_id: UUID,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_active_user),
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
 ) -> OrderResponse:
-    order = await order_service.get_order_for_view(db, user, order_id)
+    await order_service.expire_holds(db)
+    order = await order_service.get_order(db, order_id, user)
     return await _response(db, order, settings)
 
 
 @router.post("/{order_id}/confirm", response_model=OrderResponse)
 async def confirm_order(
     order_id: UUID,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_active_user),
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
     provider: EmailProvider = Depends(get_email_provider),
@@ -133,7 +132,7 @@ async def confirm_order(
 @router.post("/{order_id}/checkout", response_model=OrderResponse)
 async def checkout_order(
     order_id: UUID,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_active_user),
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
     provider: EmailProvider = Depends(get_email_provider),
@@ -144,7 +143,7 @@ async def checkout_order(
 @router.post("/{order_id}/cancel", response_model=OrderResponse)
 async def cancel_order(
     order_id: UUID,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_active_user),
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
 ) -> OrderResponse:

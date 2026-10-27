@@ -28,7 +28,7 @@ from app.services.events import as_utc
 
 logger = logging.getLogger("app.inventory")
 
-DEFAULT_HOLD_TTL_MINUTES = 15
+DEFAULT_HOLD_TTL_MINUTES = 10
 
 
 def _now() -> datetime:
@@ -185,12 +185,17 @@ async def purchase(
     """Legacy single-ticket-type checkout.
 
     Kept for backwards compatibility; it delegates to the order service so
-    free registrations, QR credentials and confirmation emails behave exactly
-    like multi-item ``POST /orders``.
+    free registrations, QR credentials, attendees and confirmation emails
+    behave exactly like multi-item ``POST /orders``.
     """
     from app.core.config import get_settings
     from app.schemas.orders import OrderCreate, OrderItemCreate
     from app.services import orders as order_service
+
+    event, ticket_type = await _lock_event_and_type(db, event_id, ticket_type_id)
+    now = _now()
+    _validate_saleable(event, ticket_type, now)
+    await _check_availability(db, event, ticket_type, payload.quantity, now)
 
     settings = settings or get_settings()
     order = await order_service.create_order(
@@ -199,7 +204,9 @@ async def purchase(
         OrderCreate(
             event_id=event_id,
             items=[
-                OrderItemCreate(ticket_type_id=ticket_type_id, quantity=payload.quantity)
+                OrderItemCreate(
+                    ticket_type_id=ticket_type_id, quantity=payload.quantity
+                )
             ],
         ),
         qr_secret=settings.effective_ticket_qr_secret,

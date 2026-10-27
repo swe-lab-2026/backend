@@ -61,7 +61,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await asyncio.sleep(settings.reservation_cleanup_interval_seconds)
                 try:
                     async with session_factory() as session:
-                        await order_service.expire_pending_orders(session)
+                        await order_service.expire_holds(session)
                         await session.commit()
                 except asyncio.CancelledError:
                     raise

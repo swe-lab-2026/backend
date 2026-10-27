@@ -171,7 +171,7 @@ available = capacity - sold - active_holds
 
 ### 5.6. Orders
 
-Создаёт заказ, рассчитывает стоимость, применяет промокод, связывает покупателя с участниками и контролирует переходы статуса заказа.
+Создаёт заказ и позиции билетов, связывает покупателя с участником и контролирует срок checkout. При создании заказа количество билетов резервируется транзакционно на 10 минут; после истечения срока заказ становится `EXPIRED`, а резерв освобождается. Бесплатная регистрация сразу создаёт подтверждённый заказ со статусом `PAID`, суммой `0.00 KZT` и билетами — платёжные данные не нужны. Организатор видит только регистрации из подтверждённых заказов через `GET /api/v1/events/{event_id}/attendees`.
 
 Основные статусы:
 
@@ -231,10 +231,10 @@ Support хранит обращения пользователей. Audit фик
 | Auth | `/auth/register`, `/auth/verify-email`, `/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/resend-verification`, `/auth/logout-all`, `/auth/request-password-reset`, `/auth/reset-password` |
 | Users | `/users/me` |
 | Organizers | `/organizers/me`, `/organizers/me/payout-account` |
-| Events | `/events/assigned`, `/events/{event_id}/admins`, `/events/{event_id}/admins/{user_id}` |
+| Events | `/events/assigned`, `/events/{event_id}/admins`, `/events/{event_id}/admins/{user_id}`, `/events/{event_id}/attendees` |
 | Ticket types | `/events/{event_id}/ticket-types` |
 | Campaigns | `/events/{event_id}/campaigns`, `/campaigns/validate` |
-| Orders | `/orders`, `/orders/{order_id}`, `/orders/{order_id}/checkout` |
+| Orders | `/orders`, `/orders/{order_id}` |
 | Payments | `/payments`, `/payments/webhook` |
 | Tickets | `/tickets`, `/tickets/{public_id}` |
 | Check-in | `/events/{event_id}/check-in` |
