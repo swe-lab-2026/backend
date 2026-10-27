@@ -3,9 +3,9 @@ requires = ["setuptools>=75", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "creepy-im-backend"
+name = "biletflow-backend"
 version = "0.1.0"
-description = "Creepy.IM backend: auth, subscription gating and the cloud agent proxy"
+description = "BiletFlow ticketing backend API (FastAPI + PostgreSQL)"
 requires-python = ">=3.10"
 dependencies = [
   "fastapi>=0.115,<1",
@@ -16,9 +16,12 @@ dependencies = [
   "asyncpg>=0.30,<1",
   "redis>=6,<9",
   "httpx>=0.28,<1",
-  # [crypto] enables RS256, required to sign Google Play service-account
-  # assertions. Plain PyJWT raises NotImplementedError at call time.
+  # [crypto] keeps RS256 available via `cryptography` if the deployment
+  # switches JWT_ALGORITHM away from HS256.
   "PyJWT[crypto]>=2.10,<3",
+  # Password hashing, used by app.core.security (bcrypt hashes of
+  # base64(sha256(password))). The hashpw/gensalt/checkpw API is stable.
+  "bcrypt>=4.1,<6",
   "orjson>=3.10,<4",
   "email-validator>=2,<3",
 ]

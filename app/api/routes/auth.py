@@ -15,6 +15,10 @@ from app.schemas.auth import (
     LoginRequest,
     LogoutRequest,
     LogoutResponse,
+    PasswordResetConfirmRequest,
+    PasswordResetConfirmResponse,
+    PasswordResetRequest,
+    PasswordResetResponse,
     RefreshRequest,
     RegisterRequest,
     RegisterResponse,
@@ -156,3 +160,37 @@ async def logout_all(
 ) -> LogoutResponse:
     await auth_service.logout_all(db, user.id)
     return LogoutResponse()
+
+
+@router.post("/request-password-reset", response_model=PasswordResetResponse)
+async def request_password_reset(
+    body: PasswordResetRequest,
+    db: AsyncSession = Depends(get_db),
+    provider: EmailProvider = Depends(get_email_provider),
+    store: TTLStore = Depends(get_store),
+    settings: Settings = Depends(get_app_settings),
+) -> PasswordResetResponse:
+    expires_in, retry_after = await auth_service.request_password_reset(
+        db, provider, store, settings, email=body.email
+    )
+    return PasswordResetResponse(
+        email=normalize_email(body.email),
+        code_expires_in=expires_in,
+        retry_after=retry_after,
+    )
+
+
+@router.post("/reset-password", response_model=PasswordResetConfirmResponse)
+async def reset_password(
+    request: Request,
+    body: PasswordResetConfirmRequest,
+    db: AsyncSession = Depends(get_db),
+) -> PasswordResetConfirmResponse:
+    user = await auth_service.reset_password(
+        db,
+        email=body.email,
+        token=body.token,
+        new_password=body.new_password,
+        ip_address=_client_ip(request),
+    )
+    return PasswordResetConfirmResponse(email=user.email)
