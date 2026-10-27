@@ -32,7 +32,19 @@ class Settings(BaseSettings):
         "sql/migrate_002_auth.sql",
         "sql/migrate_003_events.sql",
         "sql/migrate_004_password_reset.sql",
+        "sql/migrate_005_tickets.sql",
     ]
+
+    # --- Tickets / checkout ------------------------------------------------
+    # Used to sign QR admission payloads. When empty, the access-token secret
+    # is used so existing deployments keep working after an upgrade.
+    ticket_qr_secret: str = Field(default="")
+    public_base_url: str = ""
+    order_reservation_ttl_minutes: int = Field(default=15, ge=1, le=1440)
+    reservation_cleanup_interval_seconds: int = Field(default=60, ge=1, le=3600)
+    reservation_cleanup_enabled: bool = True
+    notification_retry_interval_seconds: int = Field(default=60, ge=1, le=3600)
+    notification_max_attempts: int = Field(default=5, ge=1, le=50)
 
     # --- Auth / JWT -------------------------------------------------------
     # Access and refresh tokens use different secrets, taken only from the
@@ -62,6 +74,14 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.app_env.lower() == "production"
+
+    @property
+    def effective_ticket_qr_secret(self) -> str:
+        return self.ticket_qr_secret or self.jwt_access_secret
+
+    @property
+    def public_api_base(self) -> str:
+        return f"{self.public_base_url.rstrip('/')}{self.api_prefix}"
 
     @property
     def cors_origin_list(self) -> list[str]:

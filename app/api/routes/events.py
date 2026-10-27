@@ -4,12 +4,15 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
+    get_app_settings,
     get_current_user,
     get_current_user_optional,
     get_db,
+    get_email_provider,
     require_active_user,
     require_event_owner,
 )
+from app.core.config import Settings
 from app.db import repositories as repo
 from app.db.models import Event, EventImage, TicketType, User
 from app.schemas.event_staff import (
@@ -36,7 +39,9 @@ from app.schemas.events import (
 from app.services import event_staff as staff_service
 from app.services import events as service
 from app.services import inventory as inventory_service
+from app.services import notifications
 from app.services import ticket_types as ticket_type_service
+from app.services.email import EmailProvider
 
 router = APIRouter(prefix="/events", tags=["events"])
 
@@ -403,5 +408,19 @@ async def purchase_ticket_type(
     payload: PurchaseRequest,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+    provider: EmailProvider = Depends(get_email_provider),
 ) -> PurchaseResponse:
-    return await inventory_service.purchase(db, user, event_id, ticket_type_id, payload)
+    result = await inventory_service.purchase(
+        db, user, event_id, ticket_type_id, payload, settings=settings
+    )
+    if result.status in ("PAID", "CONFIRMED") and result.tickets:
+        await db.commit()
+        await notifications.deliver_order_confirmation(
+            db,
+            order_id=result.order_id,
+            provider=provider,
+            download_base=settings.public_api_base,
+        )
+        await db.commit()
+    return result
