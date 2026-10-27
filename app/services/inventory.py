@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.errors import ApiError
 from app.db import repositories as repo
 from app.db.models import (
+    Attendee,
     Event,
     EventStatus,
     HoldStatus,
@@ -34,7 +35,7 @@ from app.services.events import as_utc
 
 logger = logging.getLogger("app.inventory")
 
-DEFAULT_HOLD_TTL_MINUTES = 15
+DEFAULT_HOLD_TTL_MINUTES = 10
 
 
 def _now() -> datetime:
@@ -200,19 +201,30 @@ async def purchase(
     unit_price = ticket_type.price
     total_amount = unit_price * quantity
 
+    expires_at = None if is_free else now + timedelta(minutes=DEFAULT_HOLD_TTL_MINUTES)
     order = Order(
         event_id=event.id,
         buyer_user_id=user.id,
         buyer_email=user.email,
         status=OrderStatus.PAID if is_free else OrderStatus.PENDING,
-        currency=ticket_type.currency,
+        currency="KZT" if is_free else ticket_type.currency,
         subtotal_amount=total_amount,
-        discount_amount=Decimal("0"),
-        fee_amount=Decimal("0"),
+        discount_amount=Decimal("0.00"),
+        fee_amount=Decimal("0.00"),
         total_amount=total_amount,
+        expires_at=expires_at,
         paid_at=now if is_free else None,
     )
     db.add(order)
+    await db.flush()
+
+    attendee = Attendee(
+        user_id=user.id,
+        full_name=f"{user.first_name} {user.last_name}".strip(),
+        email=user.email,
+        phone=user.phone,
+    )
+    db.add(attendee)
     await db.flush()
 
     tickets: list[TicketItemResponse] = []
@@ -220,9 +232,10 @@ async def purchase(
         item = OrderItem(
             order_id=order.id,
             ticket_type_id=ticket_type.id,
+            attendee_id=attendee.id,
             ticket_type_name=ticket_type.name,
             unit_price=unit_price,
-            discount_amount=Decimal("0"),
+            discount_amount=Decimal("0.00"),
             final_price=unit_price,
         )
         db.add(item)
@@ -243,6 +256,7 @@ async def purchase(
 
     hold: HoldResponse | None = None
     if not is_free:
+        assert expires_at is not None
         inventory_hold = InventoryHold(
             event_id=event.id,
             ticket_type_id=ticket_type.id,
@@ -250,7 +264,7 @@ async def purchase(
             order_id=order.id,
             quantity=quantity,
             status=HoldStatus.ACTIVE,
-            expires_at=now + timedelta(minutes=DEFAULT_HOLD_TTL_MINUTES),
+            expires_at=expires_at,
         )
         db.add(inventory_hold)
         await db.flush()
