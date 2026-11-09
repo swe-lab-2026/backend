@@ -668,3 +668,41 @@ TEST_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/test_db make test
 
 CI (`.github/workflows/ci.yml`) выполняет lint, typecheck, тесты на sqlite и полный сьют на PostgreSQL 17.
 
+
+
+## Paid ticket sales (demo payment simulation)
+
+Paid sales are activated **per event**. The event owner can inspect the checklist,
+accept the terms, simulate the activation fee, and activate sales only after the
+organizer profile is verified and an ACTIVE payout account exists.
+
+- `GET /api/v1/events/{event_id}/paid-sales/activation`
+- `POST /api/v1/events/{event_id}/paid-sales/terms` with `{"accepted": true}`
+- `POST /api/v1/events/{event_id}/paid-sales/activation-fee` (internal demo only)
+- `POST /api/v1/events/{event_id}/paid-sales/activate`
+
+The activation-fee endpoint records a **simulation**, not a real charge. The
+demo activation fee is 1,000 KZT.
+
+Paid order creation is rejected until that event is activated. The backend
+calculates a 3% processing fee (rounded to two decimal places) and stores the
+result in the order. The current demo checkout supports KZT ticket types.
+
+1. Create a pending order with `POST /api/v1/orders`.
+2. Start the internal simulation with
+   `POST /api/v1/orders/{order_id}/payments/simulate`.
+3. Resolve the demo payment with
+   `POST /api/v1/orders/payments/{payment_id}/simulate-result` and
+   `{"outcome": "success"}`, `{"outcome": "failed"}`, or
+   `{"outcome": "abandoned"}`.
+
+Every simulated payment response is marked `is_simulated: true` and carries a
+demo-only notice. No real payment provider is contacted. A successful result
+confirms the order and issues tickets; failed/abandoned results cancel the
+pending order and release its inventory holds. The unique simulated-payment
+index and row locking make repeated starts/callbacks idempotent. The legacy
+`/confirm` and `/checkout` endpoints no longer allow clients to self-confirm
+paid orders; use the payment confirmation flow instead.
+
+Apply the new `migrate_006_paid_sales.sql` migration before using these
+endpoints (it is included in the default startup migration list).

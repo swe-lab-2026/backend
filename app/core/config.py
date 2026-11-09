@@ -33,6 +33,7 @@ class Settings(BaseSettings):
         "sql/migrate_003_events.sql",
         "sql/migrate_004_password_reset.sql",
         "sql/migrate_005_tickets.sql",
+        "sql/migrate_006_paid_sales.sql",
     ]
 
     # --- Tickets / checkout ------------------------------------------------

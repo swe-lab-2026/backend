@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from app.db.models import Order, OrderNotification, Ticket
+from tests.test_orders import _activate_paid_sales
 from tests.conftest import API, access_token_for, bearer, create_user
 
 OWNER_EMAIL = "ticket-owner@example.com"
@@ -216,9 +217,10 @@ async def test_ticket_access_is_owner_buyer_or_admin_only(client, app, db):
 
 
 async def test_paid_order_only_issues_tickets_after_confirmation(client, app, db):
-    event_id, ticket_type_id, _, _, buyer, buyer_token = await _setup_event(
+    event_id, ticket_type_id, owner, owner_token, buyer, buyer_token = await _setup_event(
         client, app, db, price="50.00"
     )
+    await _activate_paid_sales(client, db, owner, owner_token, event_id)
     created = await client.post(
         f"{API}/orders",
         json={"event_id": event_id, "items": [{"ticket_type_id": ticket_type_id, "quantity": 2}]},
@@ -231,11 +233,35 @@ async def test_paid_order_only_issues_tickets_after_confirmation(client, app, db
     assert body["expires_at"] is not None
     assert app.state.email_provider.last_order_confirmation_for(BUYER_EMAIL) is None
 
-    confirmed = await client.post(
+    # Direct confirmation/checkout endpoints must not bypass payment confirmation.
+    bypass_confirm = await client.post(
+        f"{API}/orders/{body['id']}/confirm", headers=bearer(buyer_token)
+    )
+    assert bypass_confirm.status_code == 409
+    assert bypass_confirm.json()["error"]["code"] == "PAYMENT_REQUIRED"
+
+    bypass = await client.post(
         f"{API}/orders/{body['id']}/checkout", headers=bearer(buyer_token)
     )
+    assert bypass.status_code == 409
+    assert bypass.json()["error"]["code"] == "PAYMENT_REQUIRED"
+
+    started = await client.post(
+        f"{API}/orders/{body['id']}/payments/simulate", headers=bearer(buyer_token)
+    )
+    assert started.status_code == 201, started.text
+    payment_id = started.json()["payment_id"]
+    confirmed = await client.post(
+        f"{API}/orders/payments/{payment_id}/simulate-result",
+        json={"outcome": "success"},
+        headers=bearer(buyer_token),
+    )
     assert confirmed.status_code == 200, confirmed.text
-    confirmed_body = confirmed.json()
+    assert confirmed.json()["status"] == "SUCCEEDED"
+
+    order_after = await client.get(f"{API}/orders/{body['id']}", headers=bearer(buyer_token))
+    assert order_after.status_code == 200, order_after.text
+    confirmed_body = order_after.json()
     assert confirmed_body["status"] == "PAID"
     assert len(confirmed_body["tickets"]) == 2
     assert app.state.email_provider.last_order_confirmation_for(BUYER_EMAIL) is not None

@@ -37,11 +37,15 @@ from app.schemas.events import (
     TicketTypeUpdate,
 )
 from app.schemas.orders import EventAttendeeResponse
+from app.schemas.paid_sales import (
+    EventActivationResponse, TermsAcceptanceRequest,
+)
 from app.services import event_staff as staff_service
 from app.services import events as service
 from app.services import inventory as inventory_service
 from app.services import notifications
 from app.services import orders as order_service
+from app.services import paid_sales
 from app.services import ticket_types as ticket_type_service
 from app.services.email import EmailProvider
 
@@ -307,6 +311,45 @@ async def cancel_event(
 ) -> EventResponse:
     await service.cancel_event(db, actor, event)
     return await _event_detail(db, event)
+
+
+# ---------- Paid-sales activation (per event) ----------
+
+
+@router.get("/{event_id}/paid-sales/activation", response_model=EventActivationResponse)
+async def get_paid_sales_activation(
+    event: Event = Depends(require_event_owner),
+    db: AsyncSession = Depends(get_db),
+) -> EventActivationResponse:
+    return EventActivationResponse(**await paid_sales.activation_status(db, event))
+
+
+@router.post("/{event_id}/paid-sales/terms", response_model=EventActivationResponse)
+async def accept_paid_sales_terms(
+    payload: TermsAcceptanceRequest,
+    event: Event = Depends(require_event_owner),
+    db: AsyncSession = Depends(get_db),
+) -> EventActivationResponse:
+    await paid_sales.accept_terms(db, event, payload.accepted)
+    return EventActivationResponse(**await paid_sales.activation_status(db, event))
+
+
+@router.post("/{event_id}/paid-sales/activation-fee", response_model=EventActivationResponse)
+async def simulate_activation_fee(
+    event: Event = Depends(require_event_owner),
+    db: AsyncSession = Depends(get_db),
+) -> EventActivationResponse:
+    # Explicitly an internal demo simulation; no real money is collected.
+    await paid_sales.simulate_activation_fee(db, event)
+    return EventActivationResponse(**await paid_sales.activation_status(db, event))
+
+
+@router.post("/{event_id}/paid-sales/activate", response_model=EventActivationResponse)
+async def activate_paid_sales(
+    event: Event = Depends(require_event_owner),
+    db: AsyncSession = Depends(get_db),
+) -> EventActivationResponse:
+    return EventActivationResponse(**await paid_sales.activate_event(db, event))
 
 
 # ---------- Ticket types ----------
