@@ -195,3 +195,25 @@ async def require_event_checkin_access(
     ):
         return event
     await _deny_event_access(db, user, event)
+
+
+async def require_event_reversal_access(
+    event_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Event:
+    """Gate for reversing a check-in.
+
+    Reversal is a corrective action, so it is narrower than check-in access:
+    the event owner, a PLATFORM_ADMIN, or an EVENT_ADMIN of this event.
+    CHECK_IN_STAFF can admit guests but cannot undo an admission.
+    """
+    event = await repo.get_event_by_id(db, event_id)
+    if event is None:
+        raise ApiError(404, "EVENT_NOT_FOUND", "Event not found")
+    if event.owner_user_id == user.id or user.global_role == UserRole.PLATFORM_ADMIN:
+        return event
+    staff = await repo.get_event_staff(db, event_id=event_id, user_id=user.id)
+    if staff is not None and staff.role == EventStaffRole.EVENT_ADMIN:
+        return event
+    await _deny_event_access(db, user, event)

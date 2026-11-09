@@ -2,12 +2,14 @@ from datetime import datetime, timezone
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import CursorResult, delete, func, select, update
+from sqlalchemy import CursorResult, String, delete, func, or_, select, update
+from sqlalchemy import cast as sql_cast
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
     Attendee,
     AuditLog,
+    Campaign,
     EmailVerificationToken,
     Event,
     EventImage,
@@ -597,6 +599,73 @@ async def get_ticket_by_qr_hash(
         select(Ticket).where(Ticket.qr_token_hash == qr_token_hash)
     )
     return result.scalar_one_or_none()
+
+
+async def get_campaign_by_token(
+    session: AsyncSession, campaign_token: UUID
+) -> Campaign | None:
+    result = await session.execute(
+        select(Campaign).where(Campaign.campaign_token == campaign_token)
+    )
+    return result.scalar_one_or_none()
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+async def search_event_tickets(
+    session: AsyncSession,
+    event_id: UUID,
+    *,
+    query: str,
+    limit: int,
+    offset: int,
+) -> list[tuple[Ticket, OrderItem, Order, Attendee | None, TicketType]]:
+    """Search an event's tickets by attendee, order, or ticket identifiers.
+
+    The event filter is part of the SQL statement, so results can never leak
+    tickets from another event. ``%`` and ``_`` in the user's term are escaped
+    to keep the search literal.
+    """
+    pattern = f"%{_escape_like(query.strip())}%"
+    result = await session.execute(
+        select(Ticket, OrderItem, Order, Attendee, TicketType)
+        .join(OrderItem, OrderItem.id == Ticket.order_item_id)
+        .join(Order, Order.id == OrderItem.order_id)
+        .join(TicketType, TicketType.id == OrderItem.ticket_type_id)
+        .outerjoin(Attendee, Attendee.id == OrderItem.attendee_id)
+        .where(
+            Order.event_id == event_id,
+            or_(
+                Attendee.full_name.ilike(pattern, escape="\\"),
+                Attendee.email.ilike(pattern, escape="\\"),
+                sql_cast(Ticket.public_id, String).ilike(pattern, escape="\\"),
+                sql_cast(Ticket.id, String).ilike(pattern, escape="\\"),
+                sql_cast(Order.order_number, String).ilike(pattern, escape="\\"),
+            ),
+        )
+        .order_by(Ticket.issued_at.desc(), Ticket.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    return [
+        (row[0], row[1], row[2], row[3], row[4])
+        for row in result.all()
+    ]
+
+
+async def count_event_tickets_by_status(
+    session: AsyncSession, event_id: UUID
+) -> dict[TicketStatus, int]:
+    result = await session.execute(
+        select(Ticket.status, func.count(Ticket.id))
+        .join(OrderItem, OrderItem.id == Ticket.order_item_id)
+        .join(Order, Order.id == OrderItem.order_id)
+        .where(Order.event_id == event_id)
+        .group_by(Ticket.status)
+    )
+    return {status: int(count) for status, count in result.all()}
 
 
 async def list_user_tickets(

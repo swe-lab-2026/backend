@@ -37,3 +37,30 @@ class TicketValidationResponse(BaseModel):
     valid: bool
     reason: str | None
     ticket: TicketResponse
+
+
+class TicketSearchResult(BaseModel):
+    """Ticket-level row returned by the event-scoped manual search."""
+
+    ticket_id: UUID
+    public_id: UUID
+    event_id: UUID
+    order_id: UUID
+    order_number: int
+    attendee_name: str | None
+    attendee_email: str
+    ticket_type_name: str
+    status: str
+    issued_at: datetime
+    checked_in_at: datetime | None
+    cancelled_at: datetime | None
+
+
+class EventAttendanceStatsResponse(BaseModel):
+    event_id: UUID
+    total_registered: int
+    total_checked_in: int
+    remaining: int
+    cancelled: int
+    refunded: int
+    total_issued: int

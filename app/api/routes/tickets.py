@@ -8,12 +8,15 @@ from app.api.deps import (
     get_current_user,
     get_db,
     require_event_checkin_access,
+    require_event_reversal_access,
 )
 from app.core.config import Settings
 from app.db import repositories as repo
 from app.db.models import Event, Ticket, User
 from app.schemas.tickets import (
+    EventAttendanceStatsResponse,
     TicketResponse,
+    TicketSearchResult,
     TicketValidateRequest,
     TicketValidationResponse,
 )
@@ -132,6 +135,79 @@ async def check_in(
         db,
         event=event,
         qr_payload=payload.qr_payload,
+        performed_by=user,
+        qr_secret=settings.effective_ticket_qr_secret,
+        download_base=settings.public_api_base,
+    )
+
+
+@checkin_router.get(
+    "/{event_id}/tickets/search", response_model=list[TicketSearchResult]
+)
+@checkin_router.get(
+    "/{event_id}/attendees/search", response_model=list[TicketSearchResult]
+)
+async def search_event_tickets(
+    event_id: UUID,
+    q: str = Query(min_length=1, max_length=200),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    event: Event = Depends(require_event_checkin_access),
+    db: AsyncSession = Depends(get_db),
+) -> list[TicketSearchResult]:
+    return await ticket_service.search_event_tickets(
+        db, event=event, query=q, limit=limit, offset=offset
+    )
+
+
+@checkin_router.get(
+    "/{event_id}/tickets/stats", response_model=EventAttendanceStatsResponse
+)
+async def get_event_attendance_stats(
+    event_id: UUID,
+    event: Event = Depends(require_event_checkin_access),
+    db: AsyncSession = Depends(get_db),
+) -> EventAttendanceStatsResponse:
+    return await ticket_service.get_event_attendance_stats(db, event=event)
+
+
+@checkin_router.post(
+    "/{event_id}/tickets/{public_id}/check-in", response_model=TicketResponse
+)
+async def manual_check_in(
+    event_id: UUID,
+    public_id: UUID,
+    event: Event = Depends(require_event_checkin_access),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+) -> TicketResponse:
+    return await ticket_service.manual_check_in_ticket(
+        db,
+        event=event,
+        public_id=public_id,
+        performed_by=user,
+        qr_secret=settings.effective_ticket_qr_secret,
+        download_base=settings.public_api_base,
+    )
+
+
+@checkin_router.post(
+    "/{event_id}/tickets/{public_id}/reverse-check-in",
+    response_model=TicketResponse,
+)
+async def reverse_check_in(
+    event_id: UUID,
+    public_id: UUID,
+    event: Event = Depends(require_event_reversal_access),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+) -> TicketResponse:
+    return await ticket_service.reverse_check_in_ticket(
+        db,
+        event=event,
+        public_id=public_id,
         performed_by=user,
         qr_secret=settings.effective_ticket_qr_secret,
         download_base=settings.public_api_base,
