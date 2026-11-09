@@ -29,3 +29,5 @@ play-*.json
 # gigabytes in every clone for something a build step regenerates.
 /models/
 *.gguf
+ssh-key-2026-11-08.key.pub
+ssh-key-2026-11-08.key

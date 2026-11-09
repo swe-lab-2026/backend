@@ -26,7 +26,11 @@ from app.db.models import (
     User,
     UserRole,
 )
-from app.schemas.tickets import TicketResponse
+from app.schemas.tickets import (
+    EventAttendanceStatsResponse,
+    TicketResponse,
+    TicketSearchResult,
+)
 
 logger = logging.getLogger("app.tickets")
 
@@ -96,6 +100,22 @@ async def _resolve_ticket(
         if hmac.compare_digest(ticket.qr_token_hash, hash_qr_payload(payload)):
             return ticket
         raise ApiError(401, "INVALID_TICKET_QR", "Invalid ticket QR code")
+
+    # Campaign tokens are promotional links, never admission credentials. A
+    # campaign token is a bare UUID, so reject it explicitly before the legacy
+    # opaque-token lookup instead of relying on it not matching a ticket hash.
+    try:
+        campaign_token = UUID(payload)
+    except ValueError:
+        campaign_token = None
+    if campaign_token is not None:
+        campaign = await repo.get_campaign_by_token(db, campaign_token)
+        if campaign is not None:
+            raise ApiError(
+                400,
+                "CAMPAIGN_QR_NOT_ADMISSION",
+                "Campaign QR codes cannot be used for admission",
+            )
 
     ticket = await repo.get_ticket_by_qr_hash(db, hash_qr_payload(payload))
     if ticket is None:
@@ -261,6 +281,14 @@ async def get_ticket_context(
     return ticket, order, event, ticket_type
 
 
+async def _ensure_ticket_belongs_to_event(
+    db: AsyncSession, ticket: Ticket, event: Event
+) -> None:
+    context = await repo.get_ticket_order_item(db, ticket)
+    if context is None or context[2].id != event.id:
+        raise ApiError(404, "TICKET_NOT_FOUND", "Ticket not found")
+
+
 async def validate_ticket_qr(
     db: AsyncSession,
     *,
@@ -270,10 +298,8 @@ async def validate_ticket_qr(
     download_base: str,
 ) -> tuple[TicketResponse, str | None]:
     ticket = await _resolve_ticket(db, qr_payload, qr_secret)
+    await _ensure_ticket_belongs_to_event(db, ticket, event)
 
-    context = await repo.get_ticket_order_item(db, ticket)
-    if context is None or context[2].id != event.id:
-        raise ApiError(404, "TICKET_NOT_FOUND", "Ticket not found")
     response = await build_ticket_response(
         db, ticket, qr_secret=qr_secret, download_base=download_base
     )
@@ -282,22 +308,18 @@ async def validate_ticket_qr(
     return response, None
 
 
-async def check_in_ticket(
+async def _perform_check_in(
     db: AsyncSession,
     *,
+    ticket: Ticket,
     event: Event,
-    qr_payload: str,
     performed_by: User,
     qr_secret: str,
     download_base: str,
 ) -> TicketResponse:
-    ticket = await _resolve_ticket(db, qr_payload, qr_secret)
-
-    context = await repo.get_ticket_order_item(db, ticket)
-    if context is None or context[2].id != event.id:
-        raise ApiError(404, "TICKET_NOT_FOUND", "Ticket not found")
-
     now = _now()
+    # The status predicate makes the transition atomic: concurrent scans of the
+    # same ticket serialize on the row, and only the winner observes rowcount 1.
     result = await db.execute(
         update(Ticket)
         .where(Ticket.id == ticket.id, Ticket.status == TicketStatus.VALID)
@@ -347,4 +369,185 @@ async def check_in_ticket(
     logger.info("ticket %s checked in for event %s", ticket.id, event.id)
     return await build_ticket_response(
         db, ticket, qr_secret=qr_secret, download_base=download_base
+    )
+
+
+async def check_in_ticket(
+    db: AsyncSession,
+    *,
+    event: Event,
+    qr_payload: str,
+    performed_by: User,
+    qr_secret: str,
+    download_base: str,
+) -> TicketResponse:
+    ticket = await _resolve_ticket(db, qr_payload, qr_secret)
+    await _ensure_ticket_belongs_to_event(db, ticket, event)
+    return await _perform_check_in(
+        db,
+        ticket=ticket,
+        event=event,
+        performed_by=performed_by,
+        qr_secret=qr_secret,
+        download_base=download_base,
+    )
+
+
+async def manual_check_in_ticket(
+    db: AsyncSession,
+    *,
+    event: Event,
+    public_id: UUID,
+    performed_by: User,
+    qr_secret: str,
+    download_base: str,
+) -> TicketResponse:
+    """Check in a ticket chosen from the manual search results.
+
+    The client supplies only the server-issued public identifier. Status and
+    event ownership are always re-read from PostgreSQL; nothing from the
+    request is trusted beyond that identifier.
+    """
+    ticket = await repo.get_ticket_by_public_id(db, public_id)
+    if ticket is None:
+        raise ApiError(404, "TICKET_NOT_FOUND", "Ticket not found")
+    await _ensure_ticket_belongs_to_event(db, ticket, event)
+    return await _perform_check_in(
+        db,
+        ticket=ticket,
+        event=event,
+        performed_by=performed_by,
+        qr_secret=qr_secret,
+        download_base=download_base,
+    )
+
+
+async def reverse_check_in_ticket(
+    db: AsyncSession,
+    *,
+    event: Event,
+    public_id: UUID,
+    performed_by: User,
+    qr_secret: str,
+    download_base: str,
+) -> TicketResponse:
+    """Reverse an accidental check-in without deleting its audit history.
+
+    The conditional update serializes concurrent reversals and check-ins on the
+    ticket row. The original CHECK_IN row remains in ``checkin_records``; a new
+    REVERSE row records the responsible user and time.
+    """
+    ticket = await repo.get_ticket_by_public_id(db, public_id)
+    if ticket is None:
+        raise ApiError(404, "TICKET_NOT_FOUND", "Ticket not found")
+    await _ensure_ticket_belongs_to_event(db, ticket, event)
+
+    previous_checked_in_at = ticket.checked_in_at
+    now = _now()
+    result = await db.execute(
+        update(Ticket)
+        .where(Ticket.id == ticket.id, Ticket.status == TicketStatus.CHECKED_IN)
+        .values(
+            status=TicketStatus.VALID,
+            checked_in_at=None,
+            updated_at=now,
+        )
+    )
+    if (cast(CursorResult, result).rowcount or 0) != 1:
+        await db.refresh(ticket)
+        if ticket.status != TicketStatus.CHECKED_IN:
+            raise ApiError(
+                409,
+                "TICKET_NOT_CHECKED_IN",
+                "Ticket is not currently checked in",
+                details={"status": ticket.status.value},
+            )
+        raise ApiError(
+            409,
+            "TICKET_REVERSAL_CONFLICT",
+            "Ticket check-in changed while reversing; retry the request",
+            retryable=True,
+        )
+
+    db.add(
+        CheckinRecord(
+            ticket_id=ticket.id,
+            event_id=event.id,
+            performed_by=performed_by.id,
+            action=CheckinAction.REVERSE,
+        )
+    )
+    await repo.add_audit_entry(
+        db,
+        actor_user_id=performed_by.id,
+        event_id=event.id,
+        entity_type="ticket",
+        entity_id=ticket.id,
+        action="ticket.check_in_reversed",
+        before_data={
+            "status": TicketStatus.CHECKED_IN.value,
+            "checked_in_at": (
+                previous_checked_in_at.isoformat() if previous_checked_in_at else None
+            ),
+        },
+        after_data={"status": TicketStatus.VALID.value},
+    )
+    await db.flush()
+    await db.refresh(ticket)
+    logger.info("ticket %s check-in reversed for event %s", ticket.id, event.id)
+    return await build_ticket_response(
+        db, ticket, qr_secret=qr_secret, download_base=download_base
+    )
+
+
+async def search_event_tickets(
+    db: AsyncSession,
+    *,
+    event: Event,
+    query: str,
+    limit: int,
+    offset: int,
+) -> list[TicketSearchResult]:
+    rows = await repo.search_event_tickets(
+        db, event.id, query=query, limit=limit, offset=offset
+    )
+    results: list[TicketSearchResult] = []
+    for ticket, item, order, attendee, _ticket_type in rows:
+        results.append(
+            TicketSearchResult(
+                ticket_id=ticket.id,
+                public_id=ticket.public_id,
+                event_id=event.id,
+                order_id=order.id,
+                order_number=order.order_number,
+                attendee_name=attendee.full_name if attendee else None,
+                attendee_email=attendee.email if attendee else order.buyer_email,
+                ticket_type_name=item.ticket_type_name,
+                status=ticket.status.value,
+                issued_at=ticket.issued_at,
+                checked_in_at=ticket.checked_in_at,
+                cancelled_at=ticket.cancelled_at,
+            )
+        )
+    return results
+
+
+async def get_event_attendance_stats(
+    db: AsyncSession, *, event: Event
+) -> EventAttendanceStatsResponse:
+    counts = await repo.count_event_tickets_by_status(db, event.id)
+    total_issued = sum(counts.values())
+    cancelled = counts.get(TicketStatus.CANCELLED, 0)
+    refunded = counts.get(TicketStatus.REFUNDED, 0)
+    checked_in = counts.get(TicketStatus.CHECKED_IN, 0)
+    valid = counts.get(TicketStatus.VALID, 0)
+    total_registered = valid + checked_in
+    return EventAttendanceStatsResponse(
+        event_id=event.id,
+        total_registered=total_registered,
+        total_checked_in=checked_in,
+        remaining=valid,
+        cancelled=cancelled,
+        refunded=refunded,
+        total_issued=total_issued,
     )
