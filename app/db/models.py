@@ -618,6 +618,26 @@ class CampaignTicketType(Base):
 
 # ---------- Orders, attendees, and tickets ----------
 
+
+
+class EventSalesActivation(Base):
+    """Per-event paid-sales activation checklist and simulation fee state."""
+
+    __tablename__ = "event_sales_activations"
+
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("events.id", ondelete="CASCADE"), primary_key=True
+    )
+    activation_fee_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), nullable=False, default=Decimal("1000.00")
+    )
+    activation_fee_paid_at: Mapped[datetime | None] = mapped_column(TimestampTz)
+    terms_accepted_at: Mapped[datetime | None] = mapped_column(TimestampTz)
+    activated_at: Mapped[datetime | None] = mapped_column(TimestampTz)
+    created_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
+
+
 class Order(Base):
     __tablename__ = "orders"
 
@@ -833,6 +853,13 @@ class Payment(Base):
         CheckConstraint("amount > 0", name="payments_amount_positive"),
         UniqueConstraint("provider", "provider_payment_ref", name="uq_payments_provider_ref"),
         Index("idx_payments_order", "order_id"),
+        Index(
+            "uq_simulated_payment_per_order",
+            "order_id",
+            unique=True,
+            postgresql_where=text("provider = 'internal_simulation'"),
+            sqlite_where=text("provider = 'internal_simulation'"),
+        ),
     )
 
 

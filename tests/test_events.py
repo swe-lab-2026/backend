@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from app.db.models import AuditLog, InventoryHold, Order, TicketType
 from tests.conftest import API, access_token_for, bearer, create_user
+from tests.test_orders import _activate_paid_sales
 
 OWNER_EMAIL = "owner@example.com"
 STRANGER_EMAIL = "stranger@example.com"
@@ -270,7 +271,7 @@ async def test_sales_window_closed(client, app, db):
 
 # 10. Sale is impossible once the ticket type is exhausted --------------------
 async def test_ticket_type_sold_out(client, app, db):
-    _, token = await _make_organizer(client, app, db)
+    owner, token = await _make_organizer(client, app, db)
     buyer = await create_user(db, email=BUYER_EMAIL)
     buyer_token = access_token_for(app, buyer)
 
@@ -279,6 +280,7 @@ async def test_ticket_type_sold_out(client, app, db):
         client, token, event["id"], name="Limited", price="50.00", capacity=2, max_per_order=2
     )
     assert (await _publish(client, token, event["id"])).status_code == 200
+    await _activate_paid_sales(client, db, owner, token, event["id"])
 
     first = await client.post(
         f"{API}/events/{event['id']}/ticket-types/{ticket_type['id']}/purchase",
@@ -298,7 +300,7 @@ async def test_ticket_type_sold_out(client, app, db):
 
 # 11. Sale is impossible once the event capacity is reached -------------------
 async def test_event_capacity_reached(client, app, db):
-    _, token = await _make_organizer(client, app, db)
+    owner, token = await _make_organizer(client, app, db)
     buyer = await create_user(db, email=BUYER_EMAIL)
     buyer_token = access_token_for(app, buyer)
 
@@ -307,6 +309,7 @@ async def test_event_capacity_reached(client, app, db):
         client, token, event["id"], name="GA", price="50.00", capacity=10, max_per_order=10
     )
     assert (await _publish(client, token, event["id"])).status_code == 200
+    await _activate_paid_sales(client, db, owner, token, event["id"])
 
     first = await client.post(
         f"{API}/events/{event['id']}/ticket-types/{ticket_type['id']}/purchase",

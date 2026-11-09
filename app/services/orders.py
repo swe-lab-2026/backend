@@ -12,6 +12,7 @@ from app.db import repositories as repo
 from app.db.models import (
     Attendee,
     Event,
+    EventSalesActivation,
     EventStatus,
     HoldStatus,
     InventoryHold,
@@ -219,6 +220,17 @@ async def create_order(
             )
 
     is_free = subtotal == Decimal("0.00")
+    processing_fee = Decimal("0.00")
+    if not is_free:
+        if currencies != {"KZT"}:
+            raise ApiError(409, "UNSUPPORTED_CURRENCY",
+                           "Paid checkout currently supports KZT ticket types only")
+        activation = await db.get(EventSalesActivation, event.id)
+        if activation is None or activation.activated_at is None:
+            raise ApiError(409, "PAID_SALES_NOT_ACTIVATED",
+                           "Paid ticket sales are not activated for this event")
+        # Processing fee is calculated by the backend (3%, rounded to tiyn).
+        processing_fee = (subtotal * Decimal("0.03")).quantize(Decimal("0.01"))
     expires_at = (
         None
         if is_free
@@ -233,8 +245,8 @@ async def create_order(
         currency=currency,
         subtotal_amount=subtotal,
         discount_amount=Decimal("0.00"),
-        fee_amount=Decimal("0.00"),
-        total_amount=subtotal,
+        fee_amount=processing_fee,
+        total_amount=subtotal + processing_fee,
         expires_at=expires_at,
         paid_at=now if is_free else None,
     )

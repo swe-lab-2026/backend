@@ -15,6 +15,10 @@ from app.db.models import (
     OrderItem,
     OrderStatus,
     Ticket,
+    OrganizerProfile,
+    PayoutAccount,
+    PayoutStatus,
+    VerificationStatus,
 )
 from tests.conftest import API, access_token_for, bearer, create_user
 
@@ -67,6 +71,49 @@ async def _make_owner(client, app, db):
     )
     assert profile.status_code == 201, profile.text
     return owner, token
+
+
+
+
+async def _activate_paid_sales(client, db, owner, owner_token, event_id):
+    """Complete the event-scoped paid-sales checklist for checkout tests."""
+    profile = await db.get(OrganizerProfile, owner.id)
+    assert profile is not None
+    profile.verification_status = VerificationStatus.VERIFIED
+    await db.commit()
+
+    payout_response = await client.put(
+        f"{API}/organizers/me/payout-account",
+        json={
+            "provider": "TEST_BANK",
+            "external_account_ref": f"test-{owner.id}",
+            "is_default": True,
+        },
+        headers=bearer(owner_token),
+    )
+    assert payout_response.status_code == 200, payout_response.text
+    payout = await db.get(PayoutAccount, UUID(payout_response.json()["id"]))
+    assert payout is not None
+    payout.status = PayoutStatus.ACTIVE
+    await db.commit()
+
+    terms = await client.post(
+        f"{API}/events/{event_id}/paid-sales/terms",
+        json={"accepted": True},
+        headers=bearer(owner_token),
+    )
+    assert terms.status_code == 200, terms.text
+    fee = await client.post(
+        f"{API}/events/{event_id}/paid-sales/activation-fee",
+        headers=bearer(owner_token),
+    )
+    assert fee.status_code == 200, fee.text
+    activated = await client.post(
+        f"{API}/events/{event_id}/paid-sales/activate",
+        headers=bearer(owner_token),
+    )
+    assert activated.status_code == 200, activated.text
+    assert activated.json()["is_activated"] is True
 
 
 async def _make_event(client, owner_token, **event_overrides):
@@ -177,6 +224,7 @@ async def test_paid_order_reserves_inventory_and_expiration_releases_it(client, 
         owner_token,
         capacity=1,
     )
+    await _activate_paid_sales(client, db, _owner, owner_token, event["id"])
     await client.patch(
         f"{API}/events/{event['id']}/ticket-types/{ticket_type['id']}",
         json={"capacity": 1, "max_per_order": 1},
