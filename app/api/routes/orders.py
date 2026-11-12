@@ -14,12 +14,13 @@ from app.db import repositories as repo
 from app.db.models import Order, User
 from app.schemas.orders import OrderCreate, OrderResponse
 from app.schemas.paid_sales import (
-    PaymentSimulationStartResponse, PaymentSimulationResultRequest, PaymentResponse,
+    PaymentResponse,
+    PaymentSimulationResultRequest,
+    PaymentSimulationStartResponse,
 )
 from app.schemas.tickets import TicketResponse
-from app.services import notifications
+from app.services import notifications, paid_sales
 from app.services import orders as order_service
-from app.services import paid_sales
 from app.services.email import EmailProvider
 
 router = APIRouter(prefix="/orders", tags=["orders"])

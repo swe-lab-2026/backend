@@ -45,7 +45,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         engine, session_factory = create_engine_and_session_factory(settings.database_url)
         store, redis = _create_store(settings)
-        email_provider: EmailProvider = build_email_provider()
+        email_provider: EmailProvider = build_email_provider(settings)
 
         await apply_schema(engine, settings)
 
@@ -78,6 +78,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             provider=email_provider,
                             download_base=settings.public_api_base,
                             max_attempts=settings.notification_max_attempts,
+                            retry_base_seconds=settings.notification_retry_base_seconds,
+                            retry_max_seconds=settings.notification_retry_max_seconds,
                         )
                         await session.commit()
                 except asyncio.CancelledError:
@@ -100,6 +102,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for task in background_tasks:
                 with suppress(asyncio.CancelledError):
                     await task
+            await email_provider.aclose()
             await store.aclose()
             await engine.dispose()
 

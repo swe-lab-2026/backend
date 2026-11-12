@@ -14,10 +14,10 @@ from app.db.models import (
     Order,
     OrderItem,
     OrderStatus,
-    Ticket,
     OrganizerProfile,
     PayoutAccount,
     PayoutStatus,
+    Ticket,
     VerificationStatus,
 )
 from tests.conftest import API, access_token_for, bearer, create_user

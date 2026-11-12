@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import CursorResult, String, delete, func, or_, select, update
+from sqlalchemy import CursorResult, String, delete, func, not_, or_, select, update
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -322,6 +322,18 @@ async def create_payout_account(
     return account
 
 
+async def get_payout_account_by_ref(
+    session: AsyncSession, *, provider: str, external_account_ref: str
+) -> PayoutAccount | None:
+    result = await session.execute(
+        select(PayoutAccount).where(
+            PayoutAccount.provider == provider,
+            PayoutAccount.external_account_ref == external_account_ref,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
 async def clear_default_payout_account(session: AsyncSession, organizer_user_id: UUID) -> None:
     await session.execute(
         update(PayoutAccount)
@@ -331,6 +343,16 @@ async def clear_default_payout_account(session: AsyncSession, organizer_user_id:
         )
         .values(is_default=False)
     )
+
+
+async def update_payout_account(
+    session: AsyncSession,
+    account: PayoutAccount,
+    *,
+    is_default: bool,
+) -> None:
+    account.is_default = is_default
+    account.updated_at = _now()
 
 
 # ---------- Events ----------
@@ -769,6 +791,12 @@ async def list_retryable_order_notifications(
         .where(
             OrderNotification.status.in_(("PENDING", "FAILED")),
             OrderNotification.attempts < max_attempts,
+            # Permanent provider/configuration/payload failures are not retried
+            # forever. Transient and ambiguous failures remain eligible.
+            or_(
+                OrderNotification.last_error.is_(None),
+                not_(OrderNotification.last_error.startswith("permanent: ")),
+            ),
         )
         .order_by(OrderNotification.created_at.asc())
         .limit(limit)

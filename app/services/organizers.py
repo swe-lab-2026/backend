@@ -36,15 +36,27 @@ async def create_organizer_profile(
             409, "ORGANIZER_PROFILE_ALREADY_EXISTS", "Organizer profile already exists"
         )
 
-    profile = await repo.create_organizer_profile(
-        db,
-        user_id=user.id,
-        display_name=payload.display_name,
-        legal_name=_strip(payload.legal_name),
-        contact_email=_normalize_contact_email(payload.contact_email),
-        contact_phone=_strip(payload.contact_phone),
-        terms_accepted_at=datetime.now(timezone.utc) if payload.terms_accepted else None,
-    )
+    try:
+        # A pre-flight SELECT cannot make the insert idempotent: two concurrent
+        # requests can both observe "no profile". The primary key is the real
+        # guard, so isolate the insert and translate the loser's IntegrityError
+        # into the same 409 response as the sequential path.
+        async with db.begin_nested():
+            profile = await repo.create_organizer_profile(
+                db,
+                user_id=user.id,
+                display_name=payload.display_name,
+                legal_name=_strip(payload.legal_name),
+                contact_email=_normalize_contact_email(payload.contact_email),
+                contact_phone=_strip(payload.contact_phone),
+                terms_accepted_at=(
+                    datetime.now(timezone.utc) if payload.terms_accepted else None
+                ),
+            )
+    except IntegrityError as exc:
+        raise ApiError(
+            409, "ORGANIZER_PROFILE_ALREADY_EXISTS", "Organizer profile already exists"
+        ) from exc
     await repo.add_audit_entry(
         db,
         actor_user_id=user.id,
@@ -109,18 +121,40 @@ async def upsert_payout_account(
     # 404 when the organizer has no profile yet: payout belongs to a profile.
     await get_organizer_profile(db, user)
 
-    await repo.clear_default_payout_account(db, user.id)
-    try:
-        account = await repo.create_payout_account(
-            db,
-            organizer_user_id=user.id,
-            provider=payload.provider,
-            external_account_ref=payload.external_account_ref,
-            is_default=payload.is_default,
+    existing = await repo.get_payout_account_by_ref(
+        db, provider=payload.provider, external_account_ref=payload.external_account_ref
+    )
+    if existing is not None and existing.organizer_user_id != user.id:
+        raise ApiError(
+            409,
+            "PAYOUT_ACCOUNT_CONFLICT",
+            "Payout account conflicts with an existing one",
         )
+
+    try:
+        async with db.begin_nested():
+            # Only a request that asks for default may demote other accounts.
+            # A non-default PUT must leave an unrelated current default alone.
+            if payload.is_default and (
+                existing is None or not existing.is_default
+            ):
+                await repo.clear_default_payout_account(db, user.id)
+            if existing is None:
+                account = await repo.create_payout_account(
+                    db,
+                    organizer_user_id=user.id,
+                    provider=payload.provider,
+                    external_account_ref=payload.external_account_ref,
+                    is_default=payload.is_default,
+                )
+            else:
+                await repo.update_payout_account(
+                    db, existing, is_default=payload.is_default
+                )
+                account = existing
     except IntegrityError as exc:
-        # Two concurrent PUTs both claimed the single default slot; the
-        # partial unique index rejected the second one.
+        # Concurrent PUTs can race on the global (provider, reference) key or
+        # on the single-default partial index.
         raise ApiError(
             409, "PAYOUT_ACCOUNT_CONFLICT", "Payout account conflicts with an existing one"
         ) from exc
