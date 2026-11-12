@@ -191,3 +191,77 @@ async def test_payout_account_audited(client, app, db):
     entries = await _audit_actions(db, "organizer.payout_account_updated")
     assert len(entries) == 1
     assert entries[0].after_data == {"provider": "DEMO", "is_default": True}
+
+
+# 14. Repeating the same payout PUT updates instead of creating duplicates -----
+async def test_payout_upsert_is_idempotent(client, app, db):
+    _, token = await _make_owner(client, app, db)
+    await _create_profile(client, token)
+    payload = {
+        "provider": "DEMO",
+        "external_account_ref": "demo-account-001",
+        "is_default": True,
+    }
+    first = await client.put(
+        f"{API}/organizers/me/payout-account", json=payload, headers=bearer(token)
+    )
+    assert first.status_code == 200
+    second = await client.put(
+        f"{API}/organizers/me/payout-account", json=payload, headers=bearer(token)
+    )
+    assert second.status_code == 200
+    assert second.json()["id"] == first.json()["id"]
+
+    accounts = (await db.execute(select(PayoutAccount))).scalars().all()
+    assert len(accounts) == 1
+
+
+# 15. A non-default payout PUT does not demote the current default -------------
+async def test_non_default_payout_keeps_existing_default(client, app, db):
+    _, token = await _make_owner(client, app, db)
+    await _create_profile(client, token)
+    first = await client.put(
+        f"{API}/organizers/me/payout-account",
+        json={"provider": "DEMO", "external_account_ref": "demo-account-001", "is_default": True},
+        headers=bearer(token),
+    )
+    assert first.status_code == 200
+    second = await client.put(
+        f"{API}/organizers/me/payout-account",
+        json={"provider": "DEMO", "external_account_ref": "demo-account-002", "is_default": False},
+        headers=bearer(token),
+    )
+    assert second.status_code == 200
+    assert second.json()["is_default"] is False
+
+    accounts = (
+        await db.execute(select(PayoutAccount).order_by(PayoutAccount.created_at.asc()))
+    ).scalars().all()
+    assert len(accounts) == 2
+    assert accounts[0].is_default is True
+    assert accounts[1].is_default is False
+
+
+# 16. A reference owned by another organizer cannot be claimed -----------------
+async def test_payout_reference_cannot_be_shared(client, app, db):
+    _, first_token = await _make_owner(client, app, db)
+    await _create_profile(client, first_token)
+    first = await client.put(
+        f"{API}/organizers/me/payout-account",
+        json={"provider": "DEMO", "external_account_ref": "shared-ref", "is_default": True},
+        headers=bearer(first_token),
+    )
+    assert first.status_code == 200
+
+    other, other_token = await _make_owner(
+        client, app, db, email="second-owner@example.com"
+    )
+    await _create_profile(client, other_token)
+    conflict = await client.put(
+        f"{API}/organizers/me/payout-account",
+        json={"provider": "DEMO", "external_account_ref": "shared-ref", "is_default": True},
+        headers=bearer(other_token),
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "PAYOUT_ACCOUNT_CONFLICT"
+    del other

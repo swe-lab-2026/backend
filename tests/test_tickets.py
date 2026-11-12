@@ -2,8 +2,8 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from app.db.models import Order, OrderNotification, Ticket
-from tests.test_orders import _activate_paid_sales
 from tests.conftest import API, access_token_for, bearer, create_user
+from tests.test_orders import _activate_paid_sales
 
 OWNER_EMAIL = "ticket-owner@example.com"
 BUYER_EMAIL = "ticket-buyer@example.com"
@@ -325,3 +325,107 @@ async def test_legacy_purchase_endpoint_issues_signed_tickets_and_email(client, 
     assert validated.status_code == 200
     assert validated.json()["valid"] is True
     assert app.state.email_provider.last_order_confirmation_for(BUYER_EMAIL) is not None
+
+
+async def test_permanent_notification_failure_is_not_retried(client, app, db):
+    from app.db import repositories as repo
+    from app.services import notifications
+    from app.services.email import PermanentEmailError
+
+    event_id, ticket_type_id, _, _, _, buyer_token = await _setup_event(client, app, db)
+    response = await client.post(
+        f"{API}/orders",
+        json={"event_id": event_id, "items": [{"ticket_type_id": ticket_type_id, "quantity": 1}]},
+        headers=bearer(buyer_token),
+    )
+    assert response.status_code == 201, response.text
+    order_id = UUID(response.json()["id"])
+
+    notification = await repo.get_order_notification(
+        db, order_id=order_id, kind=notifications.KIND_ORDER_CONFIRMATION
+    )
+    assert notification is not None
+    notification.status = "FAILED"
+    notification.attempts = 1
+    notification.last_error = "permanent: Brevo rejected the email payload"
+    await db.commit()
+
+    calls = 0
+
+    class FailingProvider:
+        async def send_order_confirmation(self, message) -> None:
+            nonlocal calls
+            calls += 1
+            raise PermanentEmailError("Brevo rejected the email payload")
+
+    sent = await notifications.process_pending_notifications(
+        db,
+        provider=FailingProvider(),
+        download_base="http://test/api/v1",
+        max_attempts=5,
+        retry_base_seconds=0,
+    )
+    assert sent == 0
+    assert calls == 0
+
+
+async def test_transient_notification_respects_retry_backoff(client, app, db):
+    from datetime import timedelta
+
+    from app.db import repositories as repo
+    from app.services import notifications
+    from app.services.email import TransientEmailError
+
+    event_id, ticket_type_id, _, _, _, buyer_token = await _setup_event(client, app, db)
+    response = await client.post(
+        f"{API}/orders",
+        json={"event_id": event_id, "items": [{"ticket_type_id": ticket_type_id, "quantity": 1}]},
+        headers=bearer(buyer_token),
+    )
+    assert response.status_code == 201, response.text
+    order_id = UUID(response.json()["id"])
+
+    notification = await repo.get_order_notification(
+        db, order_id=order_id, kind=notifications.KIND_ORDER_CONFIRMATION
+    )
+    assert notification is not None
+    notification.status = "FAILED"
+    notification.attempts = 1
+    notification.last_error = "Brevo reported a temporary server error"
+    notification.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+
+    calls = 0
+
+    class FailingProvider:
+        async def send_order_confirmation(self, message) -> None:
+            nonlocal calls
+            calls += 1
+            raise TransientEmailError("Brevo reported a temporary server error")
+
+    sent = await notifications.process_pending_notifications(
+        db,
+        provider=FailingProvider(),
+        download_base="http://test/api/v1",
+        max_attempts=5,
+        retry_base_seconds=3600,
+    )
+    assert sent == 0
+    assert calls == 0
+
+    notification.updated_at = datetime.now(timezone.utc) - timedelta(hours=2)
+    await db.commit()
+    sent = await notifications.process_pending_notifications(
+        db,
+        provider=FailingProvider(),
+        download_base="http://test/api/v1",
+        max_attempts=5,
+        retry_base_seconds=3600,
+    )
+    assert sent == 0
+    assert calls == 1
+    await db.commit()
+    await db.refresh(notification)
+    assert notification.status == "FAILED"
+    assert notification.attempts == 2
+    assert not notification.last_error.startswith("permanent: ")

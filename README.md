@@ -208,7 +208,14 @@ PAID/PARTIALLY_REFUNDED -> REFUNDED
 
 ### 5.11. Notifications
 
-Отвечает за подтверждение email, восстановление пароля, отправку билета и уведомления об изменениях мероприятия. На первом этапе отправка может выполняться сразу после успешной операции.
+Отвечает за подтверждение email, восстановление пароля, отправку билета и уведомления об изменениях мероприятия.
+
+- В development/test используется log-only `DevEmailProvider`; реальная отправка не выполняется.
+- В production обязателен `EMAIL_PROVIDER=brevo`. Backend не запустится с dev-провайдером, без `BREVO_API_KEY` или с невалидным sender email.
+- Brevo вызывается напрямую через `httpx` (`POST /v3/smtp/email`), без отдельной очереди. HTTP-клиент создаётся один раз в lifespan.
+- Подтверждение заказа хранится в outbox `order_notifications` с уникальностью `(order_id, kind)`, поэтому повторный confirm не создаёт дубль письма и не выдаёт новые билеты.
+- Временные ошибки Brevo (429, 5xx, timeout) повторяются с exponential backoff и учётом `Retry-After`; постоянные ошибки (400/401/403, невалидный адрес) помечаются `permanent:` и больше не повторяются.
+- API-ключи, коды подтверждения, reset-токены и содержимое писем не логируются.
 
 ### 5.12. Support и Audit
 
@@ -469,9 +476,23 @@ REFRESH_TOKEN_TTL_DAYS=30
 EMAIL_CODE_TTL_MINUTES=10
 FRONTEND_WEB_URL=http://localhost:3000
 CORS_ORIGINS=http://localhost:3000
-EMAIL_FROM=no-reply@biletflow.local
+EMAIL_FROM=BiletFlow <no-reply@biletflow.local>
+
+# dev для локальной разработки; в production обязателен brevo.
+EMAIL_PROVIDER=dev
+BREVO_API_KEY=
+BREVO_SENDER_EMAIL=no-reply@your-verified-domain.com
+BREVO_SENDER_NAME=BiletFlow
+BREVO_TIMEOUT_SECONDS=10
+NOTIFICATION_RETRY_BASE_SECONDS=30
+NOTIFICATION_RETRY_MAX_SECONDS=3600
 PAYMENT_MODE=simulated
 ```
+
+Для Brevo sender email должен быть подтверждён в аккаунте Brevo (Sender
+Authentication). `BREVO_SENDER_EMAIL`/`BREVO_SENDER_NAME` имеют приоритет; если
+не заданы, используется адрес из `EMAIL_FROM`. Автоматические тесты всегда
+используют `DevEmailProvider` и не делают сетевых вызовов.
 
 Реальные значения секретов не должны находиться в репозитории.
 

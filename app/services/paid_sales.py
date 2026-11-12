@@ -8,8 +8,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ApiError
 from app.db.models import (
-    Event, EventSalesActivation, OrganizerProfile, Payment, PaymentStatus,
-    PayoutAccount, PayoutStatus, VerificationStatus, Order, OrderStatus, User,
+    Event,
+    EventSalesActivation,
+    Order,
+    OrderStatus,
+    OrganizerProfile,
+    Payment,
+    PaymentStatus,
+    PayoutAccount,
+    PayoutStatus,
+    User,
+    VerificationStatus,
 )
 from app.services import orders as order_service
 

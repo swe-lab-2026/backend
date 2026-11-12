@@ -70,7 +70,7 @@ async def _count_for_order(db, model, order_id):
 async def test_paid_ticket_purchase_is_blocked_before_event_activation(client, app, db):
     _owner, owner_token = await _create_owner(client, app, db, "inactive-owner@example.com")
     event, ticket_type = await _make_event(client, owner_token)
-    _buyer, token, response = await _create_paid_order(
+    _buyer, _token, response = await _create_paid_order(
         client, app, db, event, ticket_type, email="blocked-buyer@example.com"
     )
 
@@ -112,7 +112,7 @@ async def test_successful_payment_issues_tickets_once_and_is_idempotent(client, 
     _owner, _owner_token, event, ticket_type = await _make_paid_event(
         client, app, db, email="success-owner@example.com"
     )
-    buyer, buyer_token, order_response = await _create_paid_order(
+    _buyer, buyer_token, order_response = await _create_paid_order(
         client, app, db, event, ticket_type, email="success-buyer@example.com"
     )
     assert order_response.status_code == 201, order_response.text
@@ -182,7 +182,7 @@ async def test_failed_or_abandoned_payment_releases_inventory(
     _owner, _owner_token, event, ticket_type = await _make_paid_event(
         client, app, db, email=f"{outcome}-owner@example.com", capacity=1
     )
-    buyer, buyer_token, order_response = await _create_paid_order(
+    _buyer, buyer_token, order_response = await _create_paid_order(
         client, app, db, event, ticket_type, email=f"{outcome}-buyer@example.com"
     )
     assert order_response.status_code == 201, order_response.text
