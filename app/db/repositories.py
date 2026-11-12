@@ -866,15 +866,24 @@ async def list_assigned_events(
     session: AsyncSession,
     user_id: UUID,
     *,
-    role: EventStaffRole,
+    roles: tuple[EventStaffRole, ...],
     limit: int,
     offset: int,
 ) -> list[Event]:
+    staff_membership = (
+        select(EventStaff.event_id)
+        .where(
+            EventStaff.event_id == Event.id,
+            EventStaff.user_id == user_id,
+            EventStaff.role.in_(roles),
+        )
+        .correlate(Event)
+        .exists()
+    )
     result = await session.execute(
         select(Event)
-        .join(EventStaff, EventStaff.event_id == Event.id)
-        .where(EventStaff.user_id == user_id, EventStaff.role == role)
-        .order_by(Event.starts_at.asc())
+        .where(or_(Event.owner_user_id == user_id, staff_membership))
+        .order_by(Event.starts_at.asc(), Event.id.asc())
         .limit(limit)
         .offset(offset)
     )

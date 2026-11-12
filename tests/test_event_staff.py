@@ -1,9 +1,18 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from sqlalchemy import select
 
 from app.api import deps
 from app.core.errors import ApiError
-from app.db.models import AuditLog, UserRole, UserStatus
+from app.db.models import (
+    AuditLog,
+    Event,
+    EventStaff,
+    EventStaffRole,
+    UserRole,
+    UserStatus,
+)
 from tests.conftest import API, access_token_for, bearer, create_event, create_user
 
 OWNER_EMAIL = "owner@example.com"
@@ -18,8 +27,8 @@ async def _audit_entries(db, action: str):
     return (await db.execute(stmt)).scalars().all()
 
 
-async def _setup_owner(client, app, db):
-    owner = await create_user(db, email=OWNER_EMAIL)
+async def _setup_owner(client, app, db, *, email: str = OWNER_EMAIL):
+    owner = await create_user(db, email=email)
     owner_token = access_token_for(app, owner)
     resp = await client.post(
         f"{API}/organizers/me",
@@ -28,6 +37,31 @@ async def _setup_owner(client, app, db):
     )
     assert resp.status_code == 201
     return owner, owner_token
+
+
+async def _create_event_at(db, *, owner_user_id, title: str, starts_at: datetime) -> Event:
+    event = Event(
+        owner_user_id=owner_user_id,
+        title=title,
+        timezone="UTC",
+        starts_at=starts_at,
+        ends_at=starts_at + timedelta(hours=3),
+    )
+    db.add(event)
+    await db.commit()
+    return event
+
+
+async def _assign_staff(db, *, event_id, user_id, role: EventStaffRole) -> None:
+    db.add(
+        EventStaff(
+            event_id=event_id,
+            user_id=user_id,
+            role=role,
+            permissions={},
+        )
+    )
+    await db.commit()
 
 
 async def _assign(client, token, event_id, email):
@@ -315,3 +349,201 @@ async def test_event_staff_endpoints_require_auth(client, app, db):
     assert (
         await client.delete(f"{API}/events/{event.id}/admins/{admin.id}")
     ).status_code == 401
+
+# 34. Owner sees owned events without an event_staff row ----------------------------
+async def test_owner_sees_owned_events_without_staff_assignment(client, app, db):
+    owner, owner_token = await _setup_owner(client, app, db)
+    base = datetime.now(timezone.utc) + timedelta(days=1)
+    first = await _create_event_at(
+        db, owner_user_id=owner.id, title="Owner A", starts_at=base
+    )
+    second = await _create_event_at(
+        db, owner_user_id=owner.id, title="Owner B", starts_at=base + timedelta(hours=1)
+    )
+
+    resp = await client.get(f"{API}/events/assigned", headers=bearer(owner_token))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [item["event_id"] for item in body] == [str(first.id), str(second.id)]
+    assert set(body[0]) == {
+        "event_id",
+        "title",
+        "status",
+        "visibility",
+        "starts_at",
+        "ends_at",
+        "venue_name",
+        "city",
+        "timezone",
+    }
+
+    rows = (
+        await db.execute(select(EventStaff).where(EventStaff.user_id == owner.id))
+    ).scalars().all()
+    assert rows == []
+
+
+# 35. Event Admin sees all assigned events, in deterministic order -------------------
+async def test_admin_sees_all_assigned_events(client, app, db):
+    owner, owner_token = await _setup_owner(client, app, db)
+    base = datetime.now(timezone.utc) + timedelta(days=1)
+    first = await _create_event_at(
+        db, owner_user_id=owner.id, title="First", starts_at=base
+    )
+    second = await _create_event_at(
+        db, owner_user_id=owner.id, title="Second", starts_at=base + timedelta(hours=1)
+    )
+    third = await _create_event_at(
+        db, owner_user_id=owner.id, title="Third", starts_at=base + timedelta(hours=2)
+    )
+    admin = await create_user(db, email=ADMIN_EMAIL)
+    for event in (third, first, second):
+        assert (await _assign(client, owner_token, event.id, ADMIN_EMAIL)).status_code == 201
+
+    resp = await client.get(
+        f"{API}/events/assigned", headers=bearer(access_token_for(app, admin))
+    )
+    assert resp.status_code == 200
+    assert [item["event_id"] for item in resp.json()] == [
+        str(first.id),
+        str(second.id),
+        str(third.id),
+    ]
+
+
+# 36. Check-In Staff sees assigned events when check-in policy allows them -----------
+async def test_check_in_staff_sees_assigned_events(client, app, db):
+    owner, _ = await _setup_owner(client, app, db)
+    base = datetime.now(timezone.utc) + timedelta(days=1)
+    assigned = await _create_event_at(
+        db, owner_user_id=owner.id, title="Assigned", starts_at=base
+    )
+    await _create_event_at(
+        db, owner_user_id=owner.id, title="Not Assigned", starts_at=base + timedelta(hours=1)
+    )
+    staff = await create_user(db, email="checkin-staff@example.com")
+    await _assign_staff(
+        db, event_id=assigned.id, user_id=staff.id, role=EventStaffRole.CHECK_IN_STAFF
+    )
+
+    resp = await client.get(
+        f"{API}/events/assigned", headers=bearer(access_token_for(app, staff))
+    )
+    assert resp.status_code == 200
+    assert [item["event_id"] for item in resp.json()] == [str(assigned.id)]
+
+    allowed = await deps.require_event_checkin_access(
+        event_id=assigned.id, user=staff, db=db
+    )
+    assert allowed.id == assigned.id
+
+
+# 37. Owner of A and Event Admin of B sees both; /events still lists only owned ------
+async def test_owner_and_staff_assignment_return_union(client, app, db):
+    owner, owner_token = await _setup_owner(client, app, db)
+    other_owner, other_token = await _setup_owner(
+        client, app, db, email="owner2@example.com"
+    )
+    base = datetime.now(timezone.utc) + timedelta(days=1)
+    owned = await _create_event_at(
+        db, owner_user_id=owner.id, title="Owned", starts_at=base
+    )
+    assigned = await _create_event_at(
+        db, owner_user_id=other_owner.id, title="Assigned", starts_at=base + timedelta(hours=1)
+    )
+    assert (await _assign(client, other_token, assigned.id, OWNER_EMAIL)).status_code == 201
+
+    resp = await client.get(f"{API}/events/assigned", headers=bearer(owner_token))
+    assert resp.status_code == 200
+    assert [item["event_id"] for item in resp.json()] == [str(owned.id), str(assigned.id)]
+
+    own_events = await client.get(f"{API}/events", headers=bearer(owner_token))
+    assert own_events.status_code == 200
+    assert [item["id"] for item in own_events.json()] == [str(owned.id)]
+
+
+# 38. User with no ownership or assignments sees no events ---------------------------
+async def test_unassigned_user_sees_no_events(client, app, db):
+    owner, _ = await _setup_owner(client, app, db)
+    await create_event(db, owner_user_id=owner.id)
+    stranger = await create_user(db, email=STRANGER_EMAIL)
+
+    resp = await client.get(
+        f"{API}/events/assigned", headers=bearer(access_token_for(app, stranger))
+    )
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+# 39. Removing a staff assignment leaves the owner's access intact -------------------
+async def test_owner_access_persists_after_staff_assignment_removed(client, app, db):
+    owner, owner_token = await _setup_owner(client, app, db)
+    event = await create_event(db, owner_user_id=owner.id)
+    admin = await create_user(db, email=ADMIN_EMAIL)
+    admin_token = access_token_for(app, admin)
+
+    assert (await _assign(client, owner_token, event.id, ADMIN_EMAIL)).status_code == 201
+    assert (await _remove(client, owner_token, event.id, admin.id)).status_code == 204
+
+    owner_resp = await client.get(f"{API}/events/assigned", headers=bearer(owner_token))
+    assert [item["event_id"] for item in owner_resp.json()] == [str(event.id)]
+
+    admin_resp = await client.get(f"{API}/events/assigned", headers=bearer(admin_token))
+    assert admin_resp.json() == []
+
+
+# 40. Overlapping ownership and staff membership does not duplicate an event ---------
+async def test_owner_staff_overlap_returns_event_once(client, app, db):
+    owner, owner_token = await _setup_owner(client, app, db)
+    event = await create_event(db, owner_user_id=owner.id)
+    await _assign_staff(
+        db, event_id=event.id, user_id=owner.id, role=EventStaffRole.EVENT_ADMIN
+    )
+
+    resp = await client.get(f"{API}/events/assigned", headers=bearer(owner_token))
+    assert resp.status_code == 200
+    assert [item["event_id"] for item in resp.json()] == [str(event.id)]
+
+
+# 41. Pagination and ordering operate on the combined authorization set --------------
+async def test_assigned_pagination_operates_on_combined_set(client, app, db):
+    owner, owner_token = await _setup_owner(client, app, db)
+    other_owner, other_token = await _setup_owner(
+        client, app, db, email="owner2@example.com"
+    )
+    base = datetime.now(timezone.utc) + timedelta(days=1)
+    first = await _create_event_at(
+        db, owner_user_id=owner.id, title="First", starts_at=base
+    )
+    second = await _create_event_at(
+        db, owner_user_id=other_owner.id, title="Second", starts_at=base + timedelta(hours=1)
+    )
+    third = await _create_event_at(
+        db, owner_user_id=owner.id, title="Third", starts_at=base + timedelta(hours=2)
+    )
+    fourth = await _create_event_at(
+        db, owner_user_id=other_owner.id, title="Fourth", starts_at=base + timedelta(hours=3)
+    )
+    for event in (second, fourth):
+        assert (await _assign(client, other_token, event.id, OWNER_EMAIL)).status_code == 201
+
+    expected = [str(first.id), str(second.id), str(third.id), str(fourth.id)]
+    full = await client.get(
+        f"{API}/events/assigned?limit=100&offset=0", headers=bearer(owner_token)
+    )
+    repeated = await client.get(
+        f"{API}/events/assigned?limit=100&offset=0", headers=bearer(owner_token)
+    )
+    assert [item["event_id"] for item in full.json()] == expected
+    assert [item["event_id"] for item in repeated.json()] == expected
+
+    page_one = await client.get(
+        f"{API}/events/assigned?limit=2&offset=0", headers=bearer(owner_token)
+    )
+    page_two = await client.get(
+        f"{API}/events/assigned?limit=2&offset=2", headers=bearer(owner_token)
+    )
+    paged = [item["event_id"] for item in page_one.json()] + [
+        item["event_id"] for item in page_two.json()
+    ]
+    assert paged == expected

@@ -10,7 +10,14 @@ from app.core.config import Settings
 from app.core.errors import ApiError
 from app.core.security import TOKEN_TYPE_ACCESS, decode_token
 from app.db import repositories as repo
-from app.db.models import Event, EventStaffRole, User, UserRole, UserStatus
+from app.db.models import (
+    EVENT_CHECKIN_STAFF_ROLES,
+    Event,
+    EventStaffRole,
+    User,
+    UserRole,
+    UserStatus,
+)
 from app.kv.store import TTLStore
 from app.services.email import EmailProvider
 
@@ -189,10 +196,7 @@ async def require_event_checkin_access(
     if event.owner_user_id == user.id or user.global_role == UserRole.PLATFORM_ADMIN:
         return event
     staff = await repo.get_event_staff(db, event_id=event_id, user_id=user.id)
-    if staff is not None and staff.role in (
-        EventStaffRole.EVENT_ADMIN,
-        EventStaffRole.CHECK_IN_STAFF,
-    ):
+    if staff is not None and staff.role in EVENT_CHECKIN_STAFF_ROLES:
         return event
     await _deny_event_access(db, user, event)
 

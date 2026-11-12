@@ -612,7 +612,7 @@ PUT    /api/v1/organizers/me/payout-account   # демонстрационный
 Event Admin — **event-scoped** роль (`event_staff.role = EVENT_ADMIN`), а не глобальная. При назначении `users.global_role` не меняется. Назначения не кладутся в JWT: права проверяются запросом к PostgreSQL на каждый вызов, поэтому удаление назначения действует немедленно.
 
 ```http
-GET    /api/v1/events/assigned                        # события, где current_user = EVENT_ADMIN (пагинация limit/offset)
+GET    /api/v1/events/assigned                        # события, где current_user имеет доступ к check-in: владелец или EVENT_ADMIN/CHECK_IN_STAFF (пагинация limit/offset)
 GET    /api/v1/events/{event_id}/admins               # список Event Admin события
 POST   /api/v1/events/{event_id}/admins               # назначить (body: {"email": "..."})
 DELETE /api/v1/events/{event_id}/admins/{user_id}     # удалить назначение (204)
