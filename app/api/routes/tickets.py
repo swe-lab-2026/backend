@@ -11,6 +11,7 @@ from app.api.deps import (
     require_event_reversal_access,
 )
 from app.core.config import Settings
+from app.core.errors import ApiError
 from app.db import repositories as repo
 from app.db.models import Event, Ticket, User
 from app.schemas.tickets import (
@@ -155,8 +156,16 @@ async def search_event_tickets(
     event: Event = Depends(require_event_checkin_access),
     db: AsyncSession = Depends(get_db),
 ) -> list[TicketSearchResult]:
+    query = q.strip()
+    if not query:
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            "Search query must not be blank",
+            details={"field": "q"},
+        )
     return await ticket_service.search_event_tickets(
-        db, event=event, query=q, limit=limit, offset=offset
+        db, event=event, query=query, limit=limit, offset=offset
     )
 
 

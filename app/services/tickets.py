@@ -508,6 +508,14 @@ async def search_event_tickets(
     limit: int,
     offset: int,
 ) -> list[TicketSearchResult]:
+    query = query.strip()
+    if not query:
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            "Search query must not be blank",
+            details={"field": "q"},
+        )
     rows = await repo.search_event_tickets(
         db, event.id, query=query, limit=limit, offset=offset
     )

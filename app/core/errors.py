@@ -26,13 +26,14 @@ class ApiError(Exception):
 
 
 def error_body(exc: ApiError) -> dict[str, Any]:
-    return {
-        "error": {
-            "code": exc.code,
-            "message": exc.message,
-            "details": exc.details,
-        }
+    error: dict[str, Any] = {
+        "code": exc.code,
+        "message": exc.message,
+        "details": exc.details,
     }
+    if exc.retryable:
+        error["retryable"] = True
+    return {"error": error}
 
 
 async def api_error_handler(_request: Request, exc: ApiError) -> JSONResponse:

@@ -628,7 +628,10 @@ async def search_event_tickets(
     tickets from another event. ``%`` and ``_`` in the user's term are escaped
     to keep the search literal.
     """
-    pattern = f"%{_escape_like(query.strip())}%"
+    query = query.strip()
+    if not query:
+        raise ValueError("search query must not be blank")
+    pattern = f"%{_escape_like(query)}%"
     result = await session.execute(
         select(Ticket, OrderItem, Order, Attendee, TicketType)
         .join(OrderItem, OrderItem.id == Ticket.order_item_id)
@@ -640,6 +643,7 @@ async def search_event_tickets(
             or_(
                 Attendee.full_name.ilike(pattern, escape="\\"),
                 Attendee.email.ilike(pattern, escape="\\"),
+                Order.buyer_email.ilike(pattern, escape="\\"),
                 sql_cast(Ticket.public_id, String).ilike(pattern, escape="\\"),
                 sql_cast(Ticket.id, String).ilike(pattern, escape="\\"),
                 sql_cast(Order.order_number, String).ilike(pattern, escape="\\"),
