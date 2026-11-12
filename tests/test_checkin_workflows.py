@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import select
 
 from app.db.models import (
+    Attendee,
     Campaign,
     CampaignStatus,
     CheckinAction,
@@ -17,6 +18,7 @@ from app.db.models import (
     DiscountType,
     EventStaff,
     EventStaffRole,
+    OrderItem,
     Ticket,
     TicketStatus,
 )
@@ -191,6 +193,70 @@ async def test_manual_search_is_event_scoped_and_supports_identifiers(client, ap
     )
     assert forbidden.status_code == 403
     assert forbidden.json()["error"]["code"] == "INSUFFICIENT_EVENT_PERMISSIONS"
+
+
+async def test_search_trims_query_and_matches_buyer_email_fallback(client, app, db):
+    event_id, ticket_type_id, _owner, owner_token, buyer, buyer_token = (
+        await _setup_event(client, app, db)
+    )
+    order = await _buy(client, buyer_token, event_id, ticket_type_id, quantity=2)
+    first_ticket, second_ticket = order["tickets"]
+
+    first_row = await db.get(Ticket, UUID(first_ticket["ticket_id"]))
+    second_row = await db.get(Ticket, UUID(second_ticket["ticket_id"]))
+    assert first_row is not None and second_row is not None
+    first_item = await db.get(OrderItem, first_row.order_item_id)
+    second_item = await db.get(OrderItem, second_row.order_item_id)
+    assert first_item is not None and second_item is not None
+    attendee = await db.get(Attendee, first_item.attendee_id)
+    assert attendee is not None
+    attendee.email = "named-attendee@example.com"
+    second_item.attendee_id = None
+    await db.commit()
+
+    for blank in (" ", "   ", "\t", "\n\t "):
+        response = await client.get(
+            f"{API}/events/{event_id}/tickets/search",
+            params={"q": blank},
+            headers=bearer(owner_token),
+        )
+        assert response.status_code == 422, response.text
+        assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+    trimmed = await client.get(
+        f"{API}/events/{event_id}/tickets/search",
+        params={"q": f"  {buyer.email}  "},
+        headers=bearer(owner_token),
+    )
+    assert trimmed.status_code == 200, trimmed.text
+    assert {row["public_id"] for row in trimmed.json()} == {
+        first_ticket["public_id"],
+        second_ticket["public_id"],
+    }
+
+    fallback_row = next(
+        row for row in trimmed.json() if row["public_id"] == second_ticket["public_id"]
+    )
+    assert fallback_row["attendee_name"] is None
+    assert fallback_row["attendee_email"] == buyer.email
+
+    by_attendee = await client.get(
+        f"{API}/events/{event_id}/tickets/search",
+        params={"q": "named-attendee@example.com"},
+        headers=bearer(owner_token),
+    )
+    assert by_attendee.status_code == 200
+    assert [row["public_id"] for row in by_attendee.json()] == [
+        first_ticket["public_id"]
+    ]
+
+    literal_wildcard = await client.get(
+        f"{API}/events/{event_id}/tickets/search",
+        params={"q": "%"},
+        headers=bearer(owner_token),
+    )
+    assert literal_wildcard.status_code == 200
+    assert literal_wildcard.json() == []
 
 
 async def test_manual_check_in_uses_server_side_state_and_rejects_duplicates(
