@@ -6,7 +6,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ApiError
 from app.db import repositories as repo
-from app.db.models import Event, EventStaffRole, User, UserStatus
+from app.db.models import (
+    EVENT_CHECKIN_STAFF_ROLES,
+    Event,
+    EventStaffRole,
+    User,
+    UserStatus,
+)
 from app.schemas.event_staff import EventAdminResponse
 from app.services.auth import normalize_email
 
@@ -129,12 +135,12 @@ async def list_assigned_events(
     limit: int,
     offset: int,
 ) -> list[Event]:
-    # The filter is applied in SQL via the events<->event_staff join, never in
-    # Python, so an Event Admin can only ever see their own assignments.
+    # The ownership/staff filter is applied in SQL so results are paginated and
+    # deduplicated by the database.
     return await repo.list_assigned_events(
         db,
         user.id,
-        role=EventStaffRole.EVENT_ADMIN,
+        roles=EVENT_CHECKIN_STAFF_ROLES,
         limit=limit,
         offset=offset,
     )

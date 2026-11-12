@@ -152,6 +152,12 @@ class EventStaffRole(PyEnum):
     CHECK_IN_STAFF = "CHECK_IN_STAFF"
 
 
+EVENT_CHECKIN_STAFF_ROLES = (
+    EventStaffRole.EVENT_ADMIN,
+    EventStaffRole.CHECK_IN_STAFF,
+)
+
+
 class PaidSalesStatus(PyEnum):
     NOT_REQUESTED = "NOT_REQUESTED"
     PENDING = "PENDING"

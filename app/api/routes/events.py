@@ -156,6 +156,10 @@ async def list_assigned_events(
     user: User = Depends(require_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[AssignedEventResponse]:
+    """Events where the authenticated user has permission to perform ticket
+    verification and check-in, including events they own and events where they
+    have an authorized staff assignment.
+    """
     events = await staff_service.list_assigned_events(db, user, limit=limit, offset=offset)
     return [_assigned_response(event) for event in events]
 
