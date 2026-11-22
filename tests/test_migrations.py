@@ -215,11 +215,7 @@ async def test_pg_legacy_database_is_backfilled_and_extended():
             )
 
         applied = await apply_migration_files(engine, REAL_FILES)
-        assert applied == [
-            "migrate_003_events.sql",
-            "migrate_004_password_reset.sql",
-            "migrate_005_tickets.sql",
-        ]
+        assert applied == REAL_VERSIONS[2:]
         assert await _recorded(engine) == set(REAL_VERSIONS)
 
         # Existing state is intact: the legacy row survives and new objects exist.
@@ -262,10 +258,7 @@ async def test_pg_partial_history_converges_without_reexecution():
                 )
 
         applied = await apply_migration_files(engine, REAL_FILES)
-        assert applied == [
-            "migrate_004_password_reset.sql",
-            "migrate_005_tickets.sql",
-        ]
+        assert applied == REAL_VERSIONS[3:]
 
         # Recorded-but-unexecuted 003 was honored, not re-run.
         async with engine.connect() as conn:
