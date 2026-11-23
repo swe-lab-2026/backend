@@ -9,7 +9,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api.routes import admin, auth, events, orders, organizers, tickets, users
+from app.api.routes import (
+    admin,
+    auth,
+    campaigns,
+    events,
+    orders,
+    organizers,
+    tickets,
+    users,
+)
 from app.core.config import Settings, get_settings
 from app.core.errors import (
     ApiError,
@@ -136,6 +145,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(admin.router, prefix=settings.api_prefix)
     app.include_router(organizers.router, prefix=settings.api_prefix)
     app.include_router(events.router, prefix=settings.api_prefix)
+    app.include_router(campaigns.router, prefix=settings.api_prefix)
+    app.include_router(campaigns.public_router, prefix=settings.api_prefix)
     app.include_router(orders.router, prefix=settings.api_prefix)
     app.include_router(tickets.router, prefix=settings.api_prefix)
     app.include_router(tickets.checkin_router, prefix=settings.api_prefix)

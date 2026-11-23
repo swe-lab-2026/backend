@@ -206,6 +206,8 @@ PAID/PARTIALLY_REFUNDED -> REFUNDED
 
 Управляет промокодами, реферальными ссылками, периодом действия, лимитом использований и применимостью к типам билетов.
 
+Реализовано в SCRUM-15 — см. раздел [Promo-code campaigns and campaign QR codes](#promo-code-campaigns-and-campaign-qr-codes-scrum-15).
+
 ### 5.11. Notifications
 
 Отвечает за подтверждение email, восстановление пароля, отправку билета и уведомления об изменениях мероприятия.
@@ -240,7 +242,7 @@ Support хранит обращения пользователей. Audit фик
 | Organizers | `/organizers/me`, `/organizers/me/payout-account` |
 | Events | `/events/assigned`, `/events/{event_id}/admins`, `/events/{event_id}/admins/{user_id}`, `/events/{event_id}/attendees` |
 | Ticket types | `/events/{event_id}/ticket-types` |
-| Campaigns | `/events/{event_id}/campaigns`, `/campaigns/validate` |
+| Campaigns | `/events/{event_id}/campaigns`, `/events/{event_id}/campaigns/analytics`, `/campaigns/validate`, `/campaigns/qr/{campaign_token}` |
 | Orders | `/orders`, `/orders/{order_id}` |
 | Payments | `/payments`, `/payments/webhook` |
 | Tickets | `/tickets`, `/tickets/{public_id}` |
@@ -727,3 +729,195 @@ paid orders; use the payment confirmation flow instead.
 
 Apply the new `migrate_006_paid_sales.sql` migration before using these
 endpoints (it is included in the default startup migration list).
+
+
+## Promo-code campaigns and campaign QR codes (SCRUM-15)
+
+A campaign belongs to one event and carries a promo code, a discount, an
+optional validity window, an optional redemption limit and an optional list of
+ticket types. Organizer endpoints require the event owner (or a
+`PLATFORM_ADMIN`) through the shared `require_event_owner` dependency.
+
+### Endpoints
+
+| Method | Path | Access | Purpose |
+|---|---|---|---|
+| `POST` | `/api/v1/events/{event_id}/campaigns` | owner | Create a campaign |
+| `GET` | `/api/v1/events/{event_id}/campaigns` | owner | List campaigns |
+| `GET` | `/api/v1/events/{event_id}/campaigns/{campaign_id}` | owner | Campaign details |
+| `PATCH` | `/api/v1/events/{event_id}/campaigns/{campaign_id}` | owner | Update / disable (`{"is_active": false}`) |
+| `GET` | `/api/v1/events/{event_id}/campaigns/{campaign_id}/analytics` | owner | Performance of one campaign |
+| `GET` | `/api/v1/events/{event_id}/campaigns/analytics` | owner | Performance of all event campaigns |
+| `GET` | `/api/v1/events/{event_id}/campaigns/{campaign_id}/qr.png` | owner | PNG of the campaign QR link |
+| `POST` | `/api/v1/campaigns/validate` | signed-in user | Validate a code and preview prices (never consumes) |
+| `GET` | `/api/v1/campaigns/qr/{campaign_token}` | public | Resolve a scanned campaign QR (never consumes) |
+| `POST` | `/api/v1/orders` | signed-in user | Checkout; accepts optional `promo_code` **or** `campaign_token` |
+
+Create request:
+
+```json
+{
+  "name": "Spring promo",
+  "code": "SPRING10",
+  "discount_type": "PERCENT",
+  "discount_value": "10",
+  "starts_at": "2026-12-01T00:00:00+05:00",
+  "expires_at": "2026-12-31T23:59:59+05:00",
+  "redemption_limit": 100,
+  "ticket_type_ids": ["<ticket-type-uuid>"],
+  "is_active": true
+}
+```
+
+Validation: `PERCENT` is `0 < v <= 100`; `FIXED` is a positive KZT amount with
+at most 2 decimals; `expires_at > starts_at`; timestamps need a timezone
+offset (stored in UTC); `redemption_limit >= 1` when given; ticket types must
+belong to the campaign's event; codes are 3–40 chars `[A-Za-z0-9_-]`, stored
+upper-case and unique per event (case-insensitive). An empty `ticket_type_ids`
+means the campaign applies to all ticket types. The discount cannot change once
+the code has been used (`409 CAMPAIGN_IN_USE`), and the limit cannot drop below
+current usage (`409 REDEMPTION_LIMIT_BELOW_USAGE`). Campaigns are never
+deleted; disable them so attribution stays intact.
+
+Checkout with a promotion:
+
+```json
+POST /api/v1/orders
+{"event_id": "...", "items": [{"ticket_type_id": "...", "quantity": 2}], "promo_code": "spring10"}
+```
+
+Response fields added to every order: `campaign_id` and `promo_code` (the
+historical code snapshot); `subtotal_amount`, `discount_amount`, `fee_amount`
+and `total_amount` already existed.
+
+### Promo errors
+
+All use the standard error envelope (`{"error": {"code", "message", "details"}}`).
+
+| HTTP | Code | Meaning |
+|---|---|---|
+| 404 | `PROMO_NOT_FOUND` | No such code for this event / unknown token |
+| 409 | `PROMO_DISABLED` | Campaign is disabled |
+| 409 | `PROMO_NOT_STARTED` | Before `starts_at` |
+| 409 | `PROMO_EXPIRED` | At/after `expires_at` |
+| 409 | `PROMO_LIMIT_REACHED` | Redemption limit exhausted |
+| 409 | `PROMO_NOT_APPLICABLE` | No eligible ticket types in the order, eligible items are free, token from another event, or `FIXED` on a non-KZT order |
+| 409 | `PROMO_ALREADY_RESERVED` | The same customer already has a pending checkout with this code; `details.order_id` points to it |
+| 404 | `CAMPAIGN_NOT_FOUND` | QR token unknown, malformed, or its event is not published |
+
+### Discount calculation (server-side only)
+
+The backend recalculates every amount at checkout. Monetary fields sent by a
+client are ignored. All maths uses `Decimal` and `NUMERIC(12,2)`, never floats.
+
+- **Eligibility:** only units of eligible ticket types are discounted. Other
+  units in the same order pay full price (mixed orders are allowed).
+- **PERCENT:** each eligible unit gets `round_half_up(unit_price × pct / 100, 0.01)`.
+  The order discount is the sum of the unit discounts.
+- **FIXED (KZT):** one amount per order, capped at the eligible subtotal. It is
+  split across eligible units in proportion to price, in whole tiyn. Leftover
+  tiyn go to the first units in ticket-type-id order, so the split is
+  deterministic. Totals can never go negative.
+- **Fee:** the 3% processing fee is charged on the discounted amount.
+  `total = subtotal − discount + fee` (enforced by the `orders_total_formula`
+  CHECK).
+- **No stacking:** one promotion per order. Sending both `promo_code` and
+  `campaign_token` returns `422`.
+- A discount that brings the payable amount to `0.00` confirms the order
+  immediately (no payment step). Events with priced tickets still need paid
+  sales to be activated.
+
+Example: 2 × 25.00 KZT with 10% → subtotal 50.00, discount 5.00, fee 1.35,
+total 46.35.
+
+### Redemption lifecycle and concurrency
+
+`promo_redemptions.status` (one row per order) moves through:
+
+```text
+checkout (paid)  -> RESERVED --payment succeeded--> REDEEMED
+checkout (free)  -> REDEEMED
+RESERVED --payment failed/abandoned, reservation expired, order cancelled--> RELEASED
+REDEEMED --order cancelled/refunded--------------------------------------> RELEASED
+```
+
+- `campaigns.redemption_count` = RESERVED + REDEEMED. Checkout takes capacity
+  with a conditional `UPDATE … SET redemption_count = redemption_count + 1
+  WHERE redemption_count < max_redemptions`. Under concurrency PostgreSQL
+  re-checks that predicate on the latest row version, and the CHECK constraint
+  `campaigns_redemption_count_valid` keeps the count at or below the limit.
+  Checkouts for one event also serialize on the event row lock.
+- Releases are guarded by the status predicate, so retries and concurrent
+  cleanup never release twice or push the counter negative.
+- A pending paid checkout holds capacity until its reservation TTL
+  (`ORDER_RESERVATION_TTL_MINUTES`). A failed, abandoned or expired checkout
+  returns that capacity. Previewing (`/campaigns/validate`) and QR resolution
+  are read-only.
+- A partial unique index allows one RESERVED redemption per customer per
+  campaign. A repeated checkout gets `PROMO_ALREADY_RESERVED` and cannot drain
+  the limit.
+- A reservation is honoured at payment time even if the campaign has expired
+  or been disabled since checkout (the price was locked when the order was
+  created).
+
+### Campaign QR codes (separate from admission QR)
+
+- A campaign QR is a **promotional link, not a ticket**. It encodes
+  `{PUBLIC_WEB_BASE_URL}/campaigns/{campaign_token}`. The token is a random
+  UUIDv4 (122 bits from the OS CSPRNG): opaque, not sequential, and it carries
+  no user data or secrets.
+- Admission QR codes are HMAC-signed `v1.<ticket public_id>.<signature>`
+  payloads. The check-in and validate endpoints explicitly reject campaign
+  tokens, bare or as a URL, with `400 CAMPAIGN_QR_NOT_ADMISSION`. Any other
+  URL or random string gets `401 INVALID_TICKET_QR`. Ticket payloads do not
+  resolve as campaigns.
+- `PUBLIC_WEB_BASE_URL` has no default, so no production domain is invented.
+  While it is empty, responses include `campaign_token` and a relative
+  `qr_path`, `qr_url` is `null`, and `qr.png` returns
+  `409 CAMPAIGN_LINK_NOT_CONFIGURED`. Production requires an `https://` origin.
+
+**Frontend integration contract:**
+
+1. The web app serves the route `/campaigns/:token`.
+2. That page calls `GET /api/v1/campaigns/qr/{token}`. The response has the
+   event summary, the promotion (name, discount type and value, window,
+   eligible ticket types) and `checkout: {event_id, campaign_token}`. It
+   exposes no code, counts or buyer data.
+3. Optionally preview prices with `POST /api/v1/campaigns/validate` using
+   `campaign_token`.
+4. Check out with `POST /api/v1/orders`, passing `campaign_token`. The server
+   validates the promotion again and prices the order itself.
+
+### Analytics definitions
+
+`GET …/campaigns/{campaign_id}/analytics` is computed from the database at
+request time:
+
+| Field | Definition |
+|---|---|
+| `redemption_count` | Capacity in use now (RESERVED + REDEEMED) |
+| `reserved_redemptions` | Pending paid checkouts |
+| `successful_redemptions` | REDEEMED (paid/free-confirmed, not reversed) |
+| `released_redemptions` | Failed, expired, cancelled or refunded usages |
+| `discount_total` | Sum of discounts on REDEEMED rows |
+| `attributed_order_count` / `attributed_revenue` | **Net**: orders currently `PAID`/`CONFIRMED`, sum of `total_amount` actually charged |
+| `gross_attributed_order_count` / `gross_attributed_revenue` | Every order that was ever paid/confirmed (`paid_at` set), including ones later reversed |
+| `reversed_order_count` / `reversed_revenue` | Paid orders later cancelled or refunded (gross − net) |
+
+Refunds and cancellations lower net revenue and successful redemptions. Gross
+figures keep the historical sale. Pending, expired and failed checkouts never
+count as sales. Revenue includes the processing fee because it is the amount
+the customer paid.
+
+### Migration
+
+`sql/migrate_007_campaigns.sql` (in the default `SCHEMA_FILES` list, applied
+on startup or with `make migrate`) adds:
+- `campaigns.redemption_count` and its CHECK constraint
+- `promo_redemptions.status`, `user_id`, `released_at` and `updated_at`
+- `orders.promo_code_snapshot`
+- indexes for the reservation uniqueness, campaign/status lookups and orders
+  by campaign
+
+All changes are additive with defaults. Existing rows are backfilled and
+nothing is dropped.

@@ -208,6 +208,7 @@ async def purchase(
                     ticket_type_id=ticket_type_id, quantity=payload.quantity
                 )
             ],
+            promo_code=payload.promo_code,
         ),
         qr_secret=settings.effective_ticket_qr_secret,
         reservation_ttl_minutes=settings.order_reservation_ttl_minutes,

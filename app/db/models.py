@@ -588,6 +588,10 @@ class Campaign(Base):
     starts_at: Mapped[datetime | None] = mapped_column(TimestampTz)
     ends_at: Mapped[datetime | None] = mapped_column(TimestampTz)
     max_redemptions: Mapped[int | None] = mapped_column(Integer)
+    # Redemptions currently holding capacity (RESERVED + REDEEMED). Maintained
+    # with conditional UPDATEs and bounded by a CHECK constraint, so the limit
+    # is enforced by PostgreSQL even under concurrent checkouts.
+    redemption_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     status: Mapped[CampaignStatus] = mapped_column(
         Enum(CampaignStatus, name="campaign_status"), nullable=False, default=CampaignStatus.DRAFT
     )
@@ -596,6 +600,11 @@ class Campaign(Base):
 
     __table_args__ = (
         CheckConstraint("discount_value > 0", name="campaigns_discount_positive"),
+        CheckConstraint(
+            "redemption_count >= 0 AND "
+            "(max_redemptions IS NULL OR redemption_count <= max_redemptions)",
+            name="campaigns_redemption_count_valid",
+        ),
         CheckConstraint(
             "discount_type <> 'PERCENT' OR discount_value <= 100", name="campaigns_percent_range"
         ),
@@ -677,6 +686,9 @@ class Order(Base):
     campaign_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("campaigns.id", ondelete="SET NULL")
     )
+    # Historical snapshot of the applied promo code; kept even if the
+    # campaign is later disabled or renamed.
+    promo_code_snapshot: Mapped[str | None] = mapped_column(String(40))
     expires_at: Mapped[datetime | None] = mapped_column(TimestampTz)
     paid_at: Mapped[datetime | None] = mapped_column(TimestampTz)
     cancelled_at: Mapped[datetime | None] = mapped_column(TimestampTz)
@@ -695,6 +707,11 @@ class Order(Base):
         ),
         Index("idx_orders_buyer", "buyer_user_id", text("created_at DESC")),
         Index("idx_orders_event_status", "event_id", "status", text("created_at DESC")),
+        Index(
+            "idx_orders_campaign",
+            "campaign_id",
+            postgresql_where=text("campaign_id IS NOT NULL"),
+        ),
     )
 
 
@@ -897,6 +914,20 @@ class Refund(Base):
     )
 
 
+class PromoRedemptionStatus(PyEnum):
+    """Lifecycle of one promo usage, stored as VARCHAR + CHECK.
+
+    RESERVED: pending paid checkout holds campaign capacity.
+    REDEEMED: payment succeeded (or the order was free).
+    RELEASED: checkout failed/expired or the order was cancelled/refunded;
+              capacity has been returned to the campaign.
+    """
+
+    RESERVED = "RESERVED"
+    REDEEMED = "REDEEMED"
+    RELEASED = "RELEASED"
+
+
 class PromoRedemption(Base):
     __tablename__ = "promo_redemptions"
 
@@ -907,11 +938,34 @@ class PromoRedemption(Base):
     order_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("orders.id", ondelete="RESTRICT"), nullable=False, unique=True
     )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=PromoRedemptionStatus.REDEEMED.value
+    )
     discount_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     redeemed_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
+    released_at: Mapped[datetime | None] = mapped_column(TimestampTz)
+    updated_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
 
     __table_args__ = (
         CheckConstraint("discount_amount >= 0", name="promo_redemptions_nonnegative"),
+        CheckConstraint(
+            "status IN ('RESERVED', 'REDEEMED', 'RELEASED')",
+            name="promo_redemptions_status_valid",
+        ),
+        # One in-flight checkout per customer per campaign: repeated checkout
+        # requests cannot drain a limited code with abandoned pending orders.
+        Index(
+            "uq_promo_redemptions_active_reservation",
+            "campaign_id",
+            "user_id",
+            unique=True,
+            postgresql_where=text("status = 'RESERVED'"),
+            sqlite_where=text("status = 'RESERVED'"),
+        ),
+        Index("idx_promo_redemptions_campaign_status", "campaign_id", "status"),
     )
 
 

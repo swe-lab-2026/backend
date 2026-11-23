@@ -55,6 +55,7 @@ class Settings(BaseSettings):
         "sql/migrate_004_password_reset.sql",
         "sql/migrate_005_tickets.sql",
         "sql/migrate_006_paid_sales.sql",
+        "sql/migrate_007_campaigns.sql",
     ]
 
     # --- Tickets / checkout ------------------------------------------------
@@ -62,6 +63,11 @@ class Settings(BaseSettings):
     # is used so existing deployments keep working after an upgrade.
     ticket_qr_secret: str = Field(default="")
     public_base_url: str = ""
+    # Public HTTPS origin of the customer-facing web app. Campaign QR codes
+    # encode ``{PUBLIC_WEB_BASE_URL}/campaigns/{campaign_token}``. Left empty,
+    # the API still returns the token and path but no absolute link/QR image;
+    # no production domain is assumed.
+    public_web_base_url: str = ""
     order_reservation_ttl_minutes: int = Field(default=10, ge=1, le=1440)
     reservation_cleanup_interval_seconds: int = Field(default=60, ge=1, le=3600)
     reservation_cleanup_enabled: bool = True
@@ -137,6 +143,11 @@ class Settings(BaseSettings):
         return f"{self.public_base_url.rstrip('/')}{self.api_prefix}"
 
     @property
+    def campaign_link_base(self) -> str | None:
+        base = self.public_web_base_url.strip().rstrip("/")
+        return base or None
+
+    @property
     def cors_origin_list(self) -> list[str]:
         return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
 
@@ -159,6 +170,12 @@ class Settings(BaseSettings):
                 )
         if self.jwt_access_secret == self.jwt_refresh_secret:
             raise ValueError("JWT_ACCESS_SECRET and JWT_REFRESH_SECRET must be different")
+
+        web_base = self.public_web_base_url.strip()
+        if web_base and not web_base.startswith("https://") and self.is_production:
+            raise ValueError("PUBLIC_WEB_BASE_URL must be an https:// origin in production")
+        if web_base and not web_base.startswith(("https://", "http://")):
+            raise ValueError("PUBLIC_WEB_BASE_URL must start with https://")
 
         provider = self.normalized_email_provider
         if provider not in _EMAIL_PROVIDERS:

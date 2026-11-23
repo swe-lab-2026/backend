@@ -397,6 +397,7 @@ class TicketItemResponse(BaseModel):
 
 class PurchaseRequest(BaseModel):
     quantity: int = Field(gt=0)
+    promo_code: str | None = Field(default=None, min_length=1, max_length=40)
 
 
 class PurchaseResponse(BaseModel):
