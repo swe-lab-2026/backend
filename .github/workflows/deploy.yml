@@ -30,10 +30,24 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+      
           mkdir -p ~/.ssh
-          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
-          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+      
+          test -n "$DEPLOY_SSH_KEY" || {
+            echo "DEPLOY_SSH_KEY is empty"
+            exit 1
+          }
+      
+          printf '%s\n' "$DEPLOY_SSH_KEY" \
+            | tr -d '\r' > ~/.ssh/id_ed25519
+      
+          chmod 600 ~/.ssh/id_ed25519
+      
           ssh-keygen -y -f ~/.ssh/id_ed25519 > /dev/null
+      
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+      
           test -s ~/.ssh/known_hosts
 
       - name: Deploy verified main commit
