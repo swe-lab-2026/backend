@@ -13,7 +13,7 @@ from html import escape
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from app.services.email import OrderConfirmationEmail
+    from app.services.email import NotificationEmail, OrderConfirmationEmail
 
 
 @dataclass(frozen=True)
@@ -141,3 +141,66 @@ def render_order_confirmation_email(
         "open the ticket download links.</p>"
     )
     return EmailContent(subject=subject, text=text, html=_page(subject, body))
+
+
+_NOTIFICATION_COPY: dict[str, tuple[str, str]] = {
+    # kind: (subject prefix, lead sentence)
+    "PAYMENT_FAILED": (
+        "Payment failed",
+        "Your payment for this order was not completed, so no tickets were issued. "
+        "Any reserved tickets have been released; you can start a new checkout.",
+    ),
+    "EVENT_UPDATED": (
+        "Event details updated",
+        "The organizer changed details of an event you have tickets for. "
+        "Your tickets remain valid.",
+    ),
+    "EVENT_CANCELLED": (
+        "Event cancelled",
+        "The organizer has cancelled this event. Your tickets are no longer valid "
+        "for admission.",
+    ),
+    "REFUND_COMPLETED": (
+        "Refund completed",
+        "Your refund has been processed and your tickets have been cancelled.",
+    ),
+}
+
+_DETAIL_LABELS = {
+    "status": "Status",
+    "reason": "Reason",
+    "failure": "Failure",
+    "amount": "Amount",
+    "refund_amount": "Refund amount",
+    "changed": "Changed",
+    "cancelled_at": "Cancelled at",
+    "refunded_at": "Refunded at",
+    "updated_at": "Updated at",
+    "notice": "Note",
+}
+
+
+def render_notification_email(message: NotificationEmail) -> EmailContent:
+    prefix, lead = _NOTIFICATION_COPY.get(
+        message.kind, ("Order update", "There is an update to your order.")
+    )
+    when = _format_datetime(message.event_starts_at, message.locale)
+    venue = message.venue or "Venue to be announced"
+    subject = _safe_subject(f"{prefix} - {message.event_name} (order #{message.order_number})")
+    rows = [
+        ("Event", message.event_name),
+        ("Date", when),
+        ("Venue", venue),
+        ("Order", f"#{message.order_number}"),
+    ] + [(_DETAIL_LABELS.get(key, key), value) for key, value in message.details.items()]
+    text = f"{lead}\n\n" + "\n".join(f"{label}: {value}" for label, value in rows)
+    body = (
+        f"<p>{escape(lead)}</p><table style=\"border-collapse:collapse\">"
+        + "".join(
+            f"<tr><td style=\"padding:2px 12px 2px 0\"><strong>{escape(label)}</strong></td>"
+            f"<td>{escape(value)}</td></tr>"
+            for label, value in rows
+        )
+        + "</table>"
+    )
+    return EmailContent(subject=subject, text=text, html=_page(prefix, body))

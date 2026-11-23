@@ -1,23 +1,37 @@
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import repositories as repo
-from app.db.models import OrderNotification, OrderStatus
+from app.db.models import Event, Order, OrderNotification, OrderStatus
 from app.services.email import (
     EmailDeliveryError,
     EmailProvider,
     EmailTicket,
+    NotificationEmail,
     OrderConfirmationEmail,
 )
 
 logger = logging.getLogger("app.notifications")
 
 KIND_ORDER_CONFIRMATION = "ORDER_CONFIRMATION"
+KIND_PAYMENT_FAILED = "PAYMENT_FAILED"
+KIND_EVENT_UPDATED = "EVENT_UPDATED"
+KIND_EVENT_CANCELLED = "EVENT_CANCELLED"
+KIND_REFUND_COMPLETED = "REFUND_COMPLETED"
+LIFECYCLE_KINDS = frozenset(
+    {KIND_PAYMENT_FAILED, KIND_EVENT_UPDATED, KIND_EVENT_CANCELLED, KIND_REFUND_COMPLETED}
+)
+# Event fields whose change is worth telling ticket holders about.
+EVENT_UPDATE_NOTIFY_FIELDS = (
+    "title", "starts_at", "ends_at", "timezone", "venue_name", "venue_address", "city",
+)
 _COMMITTED_STATUSES = {OrderStatus.PAID, OrderStatus.CONFIRMED}
 _PERMANENT_PREFIX = "permanent: "
 _RETRY_AFTER_RE = re.compile(r"retry_after=(\d+)")
@@ -111,6 +125,117 @@ async def enqueue_order_confirmation(
         raise
 
 
+async def enqueue(
+    db: AsyncSession,
+    *,
+    order_id: UUID,
+    kind: str,
+    payload: dict[str, Any] | None = None,
+    dedupe_key: str = "",
+) -> OrderNotification:
+    """Idempotently add a lifecycle notification to the transactional outbox.
+
+    Written in the caller's transaction, so the email exists if and only if
+    the business change commits. ``(order_id, kind, dedupe_key)`` is unique:
+    retried operations never queue a second copy.
+    """
+    if kind not in LIFECYCLE_KINDS:
+        raise ValueError(f"unsupported notification kind {kind!r}")
+    existing = await repo.get_order_notification(
+        db, order_id=order_id, kind=kind, dedupe_key=dedupe_key
+    )
+    if existing is not None:
+        return existing
+    try:
+        async with db.begin_nested():
+            return await repo.create_order_notification(
+                db, order_id=order_id, kind=kind, dedupe_key=dedupe_key, payload=payload
+            )
+    except IntegrityError:
+        existing = await repo.get_order_notification(
+            db, order_id=order_id, kind=kind, dedupe_key=dedupe_key
+        )
+        if existing is not None:
+            return existing
+        raise
+
+
+async def enqueue_event_updated(
+    db: AsyncSession, event: Event, changed_fields: list[str], *, update_key: str
+) -> int:
+    """Queue one EVENT_UPDATED email per confirmed order of the event."""
+    order_ids = (
+        await db.execute(
+            select(Order.id).where(
+                Order.event_id == event.id, Order.status.in_(tuple(_COMMITTED_STATUSES))
+            )
+        )
+    ).scalars().all()
+    for order_id in order_ids:
+        await enqueue(
+            db,
+            order_id=order_id,
+            kind=KIND_EVENT_UPDATED,
+            dedupe_key=update_key,
+            payload={"changed": changed_fields, "updated_at": _now().isoformat()},
+        )
+    return len(order_ids)
+
+
+def _format_detail(key: str, value: Any) -> str:
+    if isinstance(value, list):
+        return ", ".join(str(item).replace("_", " ") for item in value)
+    if key.endswith("_at") and isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return value
+        return _ensure_utc(parsed).strftime("%Y-%m-%d %H:%M UTC")
+    return str(value)
+
+
+async def _deliver_lifecycle(
+    db: AsyncSession, notification: OrderNotification, provider: EmailProvider
+) -> bool:
+    order = await repo.get_order_by_id(db, notification.order_id)
+    event = await repo.get_event_by_id(db, order.event_id) if order is not None else None
+    now = _now()
+    notification.attempts += 1
+    notification.updated_at = now
+    if order is None or event is None:
+        notification.status = "FAILED"
+        notification.last_error = f"{_PERMANENT_PREFIX}order or event not found"
+        return False
+    details = {
+        key: _format_detail(key, value)
+        for key, value in (notification.payload or {}).items()
+        if value is not None
+    }
+    message = NotificationEmail(
+        email=order.buyer_email,
+        kind=notification.kind,
+        order_number=order.order_number,
+        event_name=event.title,
+        event_starts_at=event.starts_at,
+        venue=event.venue_name or event.city,
+        details=details,
+    )
+    try:
+        await provider.send_notification(message)
+    except Exception as exc:
+        notification.status = "FAILED"
+        notification.last_error = _failure_message(exc)
+        logger.warning(
+            "%s email failed for order %s (attempt %d)",
+            notification.kind, order.id, notification.attempts,
+        )
+        return False
+    notification.status = "SENT"
+    notification.sent_at = now
+    notification.last_error = None
+    return True
+
+
 async def deliver_notification(
     db: AsyncSession,
     notification: OrderNotification,
@@ -120,6 +245,8 @@ async def deliver_notification(
 ) -> bool:
     if notification.status == "SENT":
         return False
+    if notification.kind in LIFECYCLE_KINDS:
+        return await _deliver_lifecycle(db, notification, provider)
 
     order = await repo.get_order_by_id(db, notification.order_id)
     if order is None or order.status not in _COMMITTED_STATUSES:
@@ -209,6 +336,21 @@ async def deliver_order_confirmation(
     return await deliver_notification(
         db, notification, provider, download_base=download_base
     )
+
+
+async def deliver_pending_for_order(
+    db: AsyncSession, *, order_id: UUID, provider: EmailProvider, download_base: str
+) -> int:
+    """Best-effort immediate delivery after the business transaction committed.
+
+    Failures stay in the outbox for the retry worker; nothing here can roll
+    back an order, payment or refund.
+    """
+    sent = 0
+    for notification in await repo.list_order_pending_notifications(db, order_id):
+        if await deliver_notification(db, notification, provider, download_base=download_base):
+            sent += 1
+    return sent
 
 
 async def process_pending_notifications(

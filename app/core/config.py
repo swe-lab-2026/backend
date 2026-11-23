@@ -56,6 +56,7 @@ class Settings(BaseSettings):
         "sql/migrate_005_tickets.sql",
         "sql/migrate_006_paid_sales.sql",
         "sql/migrate_007_campaigns.sql",
+        "sql/migrate_008_refunds_audit.sql",
     ]
 
     # --- Tickets / checkout ------------------------------------------------
@@ -75,6 +76,9 @@ class Settings(BaseSettings):
     notification_max_attempts: int = Field(default=5, ge=1, le=50)
     notification_retry_base_seconds: int = Field(default=30, ge=0, le=3600)
     notification_retry_max_seconds: int = Field(default=3600, ge=1, le=86400)
+    # Orders processed per transaction when cancelling an event; progress is
+    # committed per batch so a crash or retry resumes where it stopped.
+    event_cancellation_batch_size: int = Field(default=100, ge=1, le=1000)
 
     # --- Auth / JWT -------------------------------------------------------
     # Access and refresh tokens use different secrets, taken only from the

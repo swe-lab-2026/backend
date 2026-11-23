@@ -7,9 +7,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ApiError
+from app.db import repositories as repo
 from app.db.models import (
     Event,
     EventSalesActivation,
+    EventStatus,
     Order,
     OrderStatus,
     OrganizerProfile,
@@ -20,6 +22,7 @@ from app.db.models import (
     User,
     VerificationStatus,
 )
+from app.services import notifications
 from app.services import orders as order_service
 
 ACTIVATION_FEE_KZT = Decimal("1000.00")
@@ -115,6 +118,8 @@ async def start_simulated_payment(db: AsyncSession, user: User, order_id: UUID) 
     if order.expires_at is not None and order.expires_at <= now_utc():
         raise ApiError(409, "ORDER_EXPIRED", "Order reservation has expired")
     event = await db.get(Event, order.event_id)
+    if event is not None and event.status == EventStatus.CANCELLED:
+        raise ApiError(409, "EVENT_CANCELLED", "This event has been cancelled")
     activation = await db.get(EventSalesActivation, order.event_id)
     if event is None or activation is None or activation.activated_at is None:
         raise ApiError(409, "PAID_SALES_NOT_ACTIVATED",
@@ -146,10 +151,21 @@ async def start_simulated_payment(db: AsyncSession, user: User, order_id: UUID) 
 async def resolve_simulated_payment(
     db: AsyncSession, user: User, payment_id: UUID, outcome: str, *, qr_secret: str
 ) -> tuple[Payment, Order]:
-    payment = await db.scalar(select(Payment).where(Payment.id == payment_id).with_for_update())
+    # Lock order then payment: the same order used by checkout, refunds and
+    # event cancellation, so these flows serialize without deadlocking.
+    order_id = await db.scalar(select(Payment.order_id).where(Payment.id == payment_id))
+    if order_id is None:
+        raise ApiError(404, "PAYMENT_NOT_FOUND", "Simulated payment not found")
+    order = await db.scalar(
+        select(Order).where(Order.id == order_id).with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    payment = await db.scalar(
+        select(Payment).where(Payment.id == payment_id).with_for_update()
+        .execution_options(populate_existing=True)
+    )
     if payment is None or payment.provider != SIMULATION_PROVIDER or not payment.is_simulated:
         raise ApiError(404, "PAYMENT_NOT_FOUND", "Simulated payment not found")
-    order = await db.scalar(select(Order).where(Order.id == payment.order_id).with_for_update())
     if order is None:
         raise ApiError(404, "ORDER_NOT_FOUND", "Order not found")
     if order.buyer_user_id != user.id:
@@ -158,7 +174,11 @@ async def resolve_simulated_payment(
         return payment, order
     if payment.status in {PaymentStatus.FAILED, PaymentStatus.CANCELLED}:
         return payment, order
+    previous = payment.status
     if outcome == "success":
+        event = await db.get(Event, order.event_id)
+        if event is not None and event.status == EventStatus.CANCELLED:
+            raise ApiError(409, "EVENT_CANCELLED", "This event has been cancelled")
         if payment.amount != order.total_amount or payment.currency != order.currency:
             raise ApiError(409, "PAYMENT_AMOUNT_MISMATCH", "Payment amount does not match order")
         await order_service.confirm_order(db, user, order.id, qr_secret=qr_secret)
@@ -170,6 +190,21 @@ async def resolve_simulated_payment(
         payment.failure_message = "Demo payment was not completed"
         if order.status == OrderStatus.PENDING:
             await order_service.cancel_order(db, user, order.id)
+        if outcome == "failed":
+            await notifications.enqueue(
+                db, order_id=order.id, kind=notifications.KIND_PAYMENT_FAILED,
+                dedupe_key=str(payment.id),
+                payload={"amount": f"{payment.amount} {payment.currency}",
+                         "status": "Payment failed",
+                         "failure": "The (simulated) payment was declined."},
+            )
     payment.updated_at = now_utc()
     await db.flush()
+    await repo.add_audit_entry(
+        db, actor_user_id=user.id, actor_type="CUSTOMER", event_id=order.event_id,
+        entity_type="payment", entity_id=payment.id, action="payment.state_changed",
+        before_data={"status": previous.value}, after_data={"status": payment.status.value},
+        metadata={"order_id": str(order.id), "is_simulated": True,
+                  "failure_code": payment.failure_code},
+    )
     return payment, order

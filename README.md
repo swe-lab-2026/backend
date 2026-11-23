@@ -921,3 +921,216 @@ on startup or with `make migrate`) adds:
 
 All changes are additive with defaults. Existing rows are backfilled and
 nothing is dropped.
+
+
+## Cancellations, refunds, notifications and audit log (SCRUM-14)
+
+All refunds are **simulated** (`is_simulated: true`): no payment provider is
+contacted and no real money moves. Only full refunds are supported.
+
+### Endpoints
+
+| Method | Path | Access | Purpose |
+|---|---|---|---|
+| `GET` | `/api/v1/events/{event_id}/refund-policy` | public (visible events) | Read the refund policy |
+| `PUT` | `/api/v1/events/{event_id}/refund-policy` | owner | Set `refunds_enabled`, `refund_deadline_hours`, `policy_text` |
+| `POST` | `/api/v1/orders/{order_id}/cancel` | buyer | Cancel a pending or free order, or refund a paid one (returns `OrderResponse`) |
+| `POST` | `/api/v1/orders/{order_id}/refund` | buyer | Explicit refund of a paid order (returns `RefundResultResponse`) |
+| `GET` | `/api/v1/orders/{order_id}/refunds` | buyer, owner, admin | Refund records for the order |
+| `GET` | `/api/v1/orders/{order_id}/refund-eligibility` | buyer | Read-only preview: cancellable or refundable, reason, amount, deadline |
+| `POST` | `/api/v1/events/{event_id}/cancel` | owner | Cancel the event (optional body `{"reason": "..."}`); safe to repeat |
+| `GET` | `/api/v1/events/{event_id}/cancellation` | owner | Cancellation progress and totals |
+| `GET` | `/api/v1/events/{event_id}/audit-log?limit=&offset=&action=` | owner | Read-only audit trail for the event |
+
+`PLATFORM_ADMIN` may act wherever the owner or buyer can.
+
+```json
+PUT /api/v1/events/{event_id}/refund-policy
+{"refunds_enabled": true, "refund_deadline_hours": 24, "policy_text": "Full refund until 24h before start"}
+
+POST /api/v1/orders/{order_id}/refund  ->  200
+{"order_id": "...", "order_status": "REFUNDED", "replayed": false,
+ "refund": {"id": "...", "amount": "23.18", "currency": "KZT", "status": "SUCCEEDED",
+            "kind": "CUSTOMER_REQUEST", "is_simulated": true, "...": "..."},
+ "notice": "DEMO ONLY — refunds are simulated; no real money is moved."}
+```
+
+### Refund eligibility rules (enforced server-side)
+
+**Customer requests** (`/cancel`, `/refund`) are allowed only for the **buyer**
+(or a platform admin) and only when:
+
+- the order is confirmed;
+- no ticket has been checked in (`409 TICKET_ALREADY_CHECKED_IN`);
+- the event has not started (`409 EVENT_ALREADY_STARTED`).
+
+A **paid** order must also meet the event policy:
+
+- `refunds_enabled` is true (`409 REFUNDS_DISABLED`);
+- the request is before `starts_at − refund_deadline_hours` (`409 REFUND_DEADLINE_PASSED`).
+
+Rejected requests are recorded in the audit log as `refund.denied`.
+
+- New and existing events default to **refunds disabled**.
+- A free registration can be cancelled until the event starts. It never creates
+  a monetary refund, and asking it for a refund returns `409 ORDER_NOT_PAID`.
+- A pending, unpaid checkout can always be cancelled. Its hold and promo
+  reservation are released and the pending simulated payment is marked
+  `CANCELLED`.
+- **Organizers cannot refund or cancel individual customer orders** through
+  `/orders/...` (`403`). This changes the previous behaviour, where the owner
+  could cancel a paid order without a refund. Organizers act through event
+  cancellation instead.
+
+**Organizer event cancellation** follows its own policy. Every paid order gets
+a full refund regardless of `refunds_enabled` or the deadline. Free
+registrations are cancelled without a refund, and pending checkouts are
+cancelled. Refund records carry `kind`: `CUSTOMER_REQUEST` or
+`EVENT_CANCELLATION`.
+
+### Lifecycle transitions
+
+```text
+Paid refund:      Order PAID -> REFUNDED | Payment SUCCEEDED -> REFUNDED
+                  Refund PENDING -> SUCCEEDED (simulated, same transaction)
+                  Tickets VALID -> REFUNDED
+Free cancel:      Order PAID/CONFIRMED -> CANCELLED | Tickets VALID -> CANCELLED
+Pending cancel:   Order PENDING -> CANCELLED | Payment PENDING -> CANCELLED | holds RELEASED
+Event cancelled:  Event -> CANCELLED (cancelled_at, cancellation_reason), then each order as above
+```
+
+Original financial records stay unchanged, and refunds are separate rows:
+
+- payment `amount` and `paid_at`;
+- order `subtotal_amount`, `discount_amount`, `total_amount` and `paid_at`.
+
+The refund amount is the payment actually charged, so a promo order refunds
+its discounted total including the fee. Every transition also releases the
+promo redemption (SCRUM-15) and frees inventory.
+
+Refunded and cancelled tickets fail both `/tickets/validate`
+(`valid: false, reason: TICKET_REFUNDED | TICKET_CANCELLED`) and `/check-in`
+(`409 TICKET_NOT_VALID`). This is the existing admission check; no second
+validation path was added.
+
+### Idempotency and concurrency
+
+- Every refund or cancellation locks the **order row, then its payment**. The
+  payment simulation uses the same order (changed from payment-then-order), so
+  the flows serialize without deadlocks.
+- A refund is only created from `PAID` + `SUCCEEDED`. A partial unique index
+  `uq_refunds_active_per_payment` allows **one non-failed refund per payment**
+  at the database level.
+- Repeating `/refund` or `/cancel` returns `200` with the stored result and
+  `replayed: true` (for `/refund`). Nothing is processed again and no second
+  email is queued. Concurrent requests serialize on the row lock: one does the
+  work and the rest replay.
+- No network call happens while business rows are locked. Emails are queued in
+  the outbox and sent after commit.
+
+### Event cancellation processing
+
+1. The event row is locked, set to `CANCELLED` (with an audit entry) and
+   committed, so new checkouts and payments are rejected (`EVENT_CANCELLED`).
+2. Active orders are closed in committed batches of
+   `EVENT_CANCELLATION_BATCH_SIZE`, using `FOR UPDATE SKIP LOCKED`. Progress is
+   the orders themselves: an order leaves PENDING/PAID/CONFIRMED exactly once.
+3. If the process dies mid-way, calling `POST /events/{id}/cancel` again, or
+   the background sweep (every `RESERVATION_CLEANUP_INTERVAL_SECONDS`),
+   resumes with the remaining orders. Refunds and notifications are never
+   duplicated.
+4. `GET /events/{id}/cancellation` reports `orders_remaining`,
+   `orders_refunded`, `orders_cancelled`, `event_cancellation_refund_total` and
+   `complete`.
+
+Campaign attribution (`orders.campaign_id`, `promo_code_snapshot`) is kept, and
+campaign analytics count these orders as reversed.
+
+### Notifications
+
+Notifications use the existing transactional outbox (`order_notifications`)
+and the existing provider (Brevo in production, the log-only dev provider
+otherwise). Rows are written in the **same transaction** as the business
+change and delivered after commit; the retry worker uses exponential backoff
+and treats permanent errors as final. Uniqueness on
+`(order_id, kind, dedupe_key)` makes enqueueing idempotent.
+
+| Kind | Trigger | Dedupe | Context in the email |
+|---|---|---|---|
+| `PAYMENT_FAILED` | simulated payment `failed` (not `abandoned`) | per payment | event, order #, amount, status |
+| `EVENT_UPDATED` | owner changes title, start/end time, timezone, venue name/address or city on a published event | per update × order | event, order #, changed fields, timestamp |
+| `EVENT_CANCELLED` | event cancellation (confirmed orders) | per order | event, order #, reason, refund amount (if any), timestamp |
+| `REFUND_COMPLETED` | customer refund | per order | event, order #, refund amount, timestamp, demo notice |
+
+Event-cancellation refunds are announced inside the `EVENT_CANCELLED` email,
+so buyers get one email, not two. Emails contain no payment details, tokens or
+other customers' data, and all user text is HTML-escaped.
+
+### Audit log
+
+`audit_logs` gives each entry these fields:
+
+- `id`, `timestamp` (`created_at`)
+- `actor_id` (`actor_user_id`), `actor_type` (`CUSTOMER`, `ORGANIZER`,
+  `PLATFORM_ADMIN`, `USER` or `SYSTEM`)
+- `action`, `entity_type`, `entity_id`, `event_id`
+- `metadata`, `before`, `after`
+- `request_id` (the `X-Request-ID` correlation id)
+
+Entries are written in the business transaction, so they commit or roll back
+together with it.
+
+Recorded actions include `event.updated`, `event.cancelled`,
+`event.refund_policy_updated`, `order.cancelled`, `order.refunded`,
+`refund.requested`, `refund.completed`, `refund.denied`,
+`payment.state_changed` and `campaign.created/updated`.
+
+Keys that look like credentials (`password`, `token`, `secret`, `api_key`,
+`card`, …) are stripped, and no emails or payment secrets are written.
+
+**Append-only through ordinary interfaces:**
+
+- **API:** only `GET` exists; `POST`, `PUT`, `PATCH` and `DELETE` return
+  `405`. Owners see only their own events.
+- **ORM:** a `before_update`/`before_delete` listener raises.
+- **PostgreSQL:** the trigger `trg_audit_logs_append_only` rejects `UPDATE`,
+  `DELETE` and `TRUNCATE`. The one exception is the FK cascade that nulls
+  `actor_user_id`/`event_id` when a user or draft event is deleted.
+
+This is **not cryptographic immutability**: a database superuser or the table
+owner can disable the trigger. For stronger guarantees, run the API with a
+role that does not own the table.
+
+### Migration
+
+`sql/migrate_008_refunds_audit.sql` is in the default `SCHEMA_FILES` and is
+applied on startup or with `make migrate`. It adds:
+
+- event policy and cancellation columns;
+- refund `kind`, `currency`, `is_simulated`, `completed_at` and the unique
+  refund index;
+- outbox `dedupe_key` and `payload` (replacing the `(order_id, kind)` unique
+  constraint with `(order_id, kind, dedupe_key)`);
+- audit `actor_type`, `metadata`, `request_id`, an event index and the
+  append-only trigger.
+
+All changes are additive with defaults. Existing audit rows with an actor are
+backfilled to `actor_type = 'USER'`.
+
+### Testing simulated refunds manually
+
+1. Create and publish an event with a paid KZT ticket type and activate paid
+   sales (see *Paid ticket sales* above).
+2. `PUT /events/{id}/refund-policy` with `{"refunds_enabled": true}`.
+3. Buy: `POST /orders`, then `POST /orders/{id}/payments/simulate`, then
+   `POST /orders/payments/{payment_id}/simulate-result` with `{"outcome": "success"}`.
+4. `GET /orders/{id}/refund-eligibility`, then `POST /orders/{id}/refund`.
+   Repeat the call and expect `replayed: true`.
+5. Scan the old ticket QR at `/events/{id}/check-in` and expect `409 TICKET_NOT_VALID`.
+6. `GET /events/{id}/audit-log` to see the trail. With `EMAIL_PROVIDER=dev`,
+   emails appear in the API logs.
+7. For event cancellation: `POST /events/{id}/cancel` with a reason, then
+   `GET /events/{id}/cancellation`.
+
+Automated: `make test` (SQLite) or, for the locking, concurrency and trigger
+tests, `TEST_DATABASE_URL=postgresql+asyncpg://… make test`.

@@ -737,11 +737,15 @@ async def test_campaign_analytics_after_purchase_and_refund(client, app, db):
     assert analytics["gross_attributed_revenue"] == "46.36"
     assert analytics["reversed_order_count"] == 0
 
-    # Reverse one paid order (cancellation; SCRUM-14 refunds reuse the same
-    # release path). Net figures drop, gross keeps the historical sale.
+    # Refund one paid order (SCRUM-14 customer refund; needs the event policy).
+    # Net figures drop, gross keeps the historical sale.
+    policy = await client.put(f"{API}/events/{event['id']}/refund-policy",
+                              json={"refunds_enabled": True}, headers=bearer(owner_token))
+    assert policy.status_code == 200, policy.text
     cancel = await client.post(f"{API}/orders/{orders[1]['id']}/cancel",
                                headers=bearer(tokens[1]))
     assert cancel.status_code == 200, cancel.text
+    assert cancel.json()["status"] == "REFUNDED"
     analytics = await _analytics(client, owner_token, event["id"], campaign["id"])
     assert analytics["successful_redemptions"] == 1
     assert analytics["discount_total"] == "2.50"

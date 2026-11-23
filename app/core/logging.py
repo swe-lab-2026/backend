@@ -2,6 +2,7 @@ import logging
 import sys
 import time
 import uuid
+from contextvars import ContextVar
 from typing import Any
 
 import orjson
@@ -10,6 +11,9 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 REQUEST_ID_HEADER = "X-Request-ID"
+
+# Correlation id of the HTTP request being served; recorded on audit entries.
+current_request_id: ContextVar[str | None] = ContextVar("current_request_id", default=None)
 
 
 class JsonFormatter(logging.Formatter):
@@ -53,11 +57,13 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         request_id = request.headers.get(REQUEST_ID_HEADER) or uuid.uuid4().hex
         request.state.request_id = request_id
+        token = current_request_id.set(request_id[:64])
         started = time.perf_counter()
         logger = logging.getLogger("app.http")
         try:
             response = await call_next(request)
         except Exception:
+            current_request_id.reset(token)
             log_with_context(
                 logger,
                 logging.ERROR,
@@ -68,6 +74,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                 duration_ms=round((time.perf_counter() - started) * 1000, 2),
             )
             raise
+        current_request_id.reset(token)
         response.headers[REQUEST_ID_HEADER] = request_id
         log_with_context(
             logger,

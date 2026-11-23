@@ -24,6 +24,7 @@ from sqlalchemy import (
     Text,
     TypeDecorator,
     UniqueConstraint,
+    event,
     text,
 )
 from sqlalchemy.dialects.postgresql import CITEXT, INET, JSONB
@@ -437,7 +438,14 @@ class Event(Base):
     registration_starts_at: Mapped[datetime | None] = mapped_column(TimestampTz)
     registration_ends_at: Mapped[datetime | None] = mapped_column(TimestampTz)
     capacity: Mapped[int | None] = mapped_column(Integer)
+    # Free-text policy shown to customers (pre-existing).
     refund_policy: Mapped[str | None] = mapped_column(Text)
+    # Enforced refund rules (SCRUM-14). Customer refunds are allowed only when
+    # enabled and before ``starts_at - refund_deadline_hours``.
+    refunds_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    refund_deadline_hours: Mapped[int | None] = mapped_column(Integer)
+    cancelled_at: Mapped[datetime | None] = mapped_column(TimestampTz)
+    cancellation_reason: Mapped[str | None] = mapped_column(Text)
     published_at: Mapped[datetime | None] = mapped_column(TimestampTz)
     created_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
@@ -445,6 +453,10 @@ class Event(Base):
     __table_args__ = (
         CheckConstraint("ends_at > starts_at", name="events_time_order"),
         CheckConstraint("capacity IS NULL OR capacity > 0", name="events_capacity_positive"),
+        CheckConstraint(
+            "refund_deadline_hours IS NULL OR refund_deadline_hours BETWEEN 0 AND 8760",
+            name="events_refund_deadline_valid",
+        ),
         CheckConstraint(
             "latitude IS NULL OR latitude BETWEEN -90 AND 90", name="events_latitude_range"
         ),
@@ -732,6 +744,11 @@ class OrderNotification(Base):
     kind: Mapped[str] = mapped_column(
         String(50), nullable=False, default="ORDER_CONFIRMATION"
     )
+    # Distinguishes repeatable kinds (e.g. one EVENT_UPDATED per update);
+    # empty for once-per-order kinds.
+    dedupe_key: Mapped[str] = mapped_column(String(100), nullable=False, default="")
+    # Context captured at enqueue time (never secrets or payment details).
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JsonType)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error: Mapped[str | None] = mapped_column(Text)
@@ -744,7 +761,9 @@ class OrderNotification(Base):
             "status IN ('PENDING', 'SENT', 'FAILED')",
             name="order_notifications_status_valid",
         ),
-        UniqueConstraint("order_id", "kind", name="uq_order_notifications_order_kind"),
+        UniqueConstraint(
+            "order_id", "kind", "dedupe_key", name="uq_order_notifications_order_kind_key"
+        ),
         Index(
             "idx_order_notifications_pending",
             "status",
@@ -905,12 +924,29 @@ class Refund(Base):
     status: Mapped[RefundStatus] = mapped_column(
         Enum(RefundStatus, name="refund_status"), nullable=False, default=RefundStatus.PENDING
     )
+    # CUSTOMER_REQUEST (policy-checked) or EVENT_CANCELLATION (organizer).
+    kind: Mapped[str] = mapped_column(String(30), nullable=False, default="CUSTOMER_REQUEST")
+    currency: Mapped[str] = mapped_column(CHAR(3), nullable=False, default="KZT")
+    is_simulated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    completed_at: Mapped[datetime | None] = mapped_column(TimestampTz)
     created_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
 
     __table_args__ = (
         CheckConstraint("amount > 0", name="refunds_amount_positive"),
+        CheckConstraint(
+            "kind IN ('CUSTOMER_REQUEST', 'EVENT_CANCELLATION')", name="refunds_kind_valid"
+        ),
         Index("idx_refunds_order", "order_id"),
+        # Full refunds only: at most one non-failed refund per payment, so a
+        # repeated or concurrent request can never pay out twice.
+        Index(
+            "uq_refunds_active_per_payment",
+            "payment_id",
+            unique=True,
+            postgresql_where=text("status IN ('PENDING', 'SUCCEEDED')"),
+            sqlite_where=text("status IN ('PENDING', 'SUCCEEDED')"),
+        ),
     )
 
 
@@ -1090,14 +1126,32 @@ class AuditLog(Base):
     entity_type: Mapped[str] = mapped_column(String(100), nullable=False)
     entity_id: Mapped[uuid.UUID | None] = mapped_column()
     action: Mapped[str] = mapped_column(String(100), nullable=False)
+    # USER | CUSTOMER | ORGANIZER | PLATFORM_ADMIN | SYSTEM
+    actor_type: Mapped[str] = mapped_column(String(20), nullable=False, default="SYSTEM")
     before_data: Mapped[dict[str, Any] | None] = mapped_column(JsonType)
     after_data: Mapped[dict[str, Any] | None] = mapped_column(JsonType)
+    # ``metadata`` is reserved on declarative classes, hence the attribute name.
+    meta: Mapped[dict[str, Any] | None] = mapped_column("metadata", JsonType)
+    request_id: Mapped[str | None] = mapped_column(String(64))
     ip_address: Mapped[str | None] = mapped_column(InetType)
     created_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
 
     __table_args__ = (
         Index("idx_audit_logs_entity", "entity_type", "entity_id", text("created_at DESC")),
+        Index(
+            "idx_audit_logs_event",
+            "event_id",
+            text("created_at DESC"),
+            postgresql_where=text("event_id IS NOT NULL"),
+        ),
     )
+
+
+@event.listens_for(AuditLog, "before_update")
+@event.listens_for(AuditLog, "before_delete")
+def _audit_log_is_append_only(*_args: Any) -> None:
+    """ORM-level guard; PostgreSQL enforces the same rule with a trigger."""
+    raise PermissionError("audit_logs is append-only")
 
 
 # ---------- Optional module: assigned seating ----------

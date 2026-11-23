@@ -41,10 +41,17 @@ from app.schemas.paid_sales import (
     EventActivationResponse,
     TermsAcceptanceRequest,
 )
+from app.schemas.refunds import (
+    AuditEntryResponse,
+    EventCancellationSummary,
+    EventCancelRequest,
+    RefundPolicyResponse,
+    RefundPolicyUpdate,
+)
 from app.services import event_staff as staff_service
 from app.services import events as service
 from app.services import inventory as inventory_service
-from app.services import notifications, paid_sales
+from app.services import notifications, paid_sales, refunds
 from app.services import orders as order_service
 from app.services import ticket_types as ticket_type_service
 from app.services.email import EmailProvider
@@ -243,8 +250,11 @@ async def update_event(
     event: Event = Depends(require_event_owner),
     actor: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+    provider: EmailProvider = Depends(get_email_provider),
 ) -> EventResponse:
     await service.update_event(db, actor, event, payload)
+    await _flush_outbox(db, settings, provider)
     return await _event_detail(db, event)
 
 
@@ -306,15 +316,107 @@ async def unpublish_event(
     return await _event_detail(db, event)
 
 
+async def _flush_outbox(db: AsyncSession, settings: Settings, provider: EmailProvider) -> None:
+    """Commit, then best-effort send queued emails (the worker retries the rest)."""
+    await db.commit()
+    await notifications.process_pending_notifications(
+        db,
+        provider=provider,
+        download_base=settings.public_api_base,
+        max_attempts=settings.notification_max_attempts,
+        limit=200,
+    )
+    await db.commit()
+
+
 @router.post("/{event_id}/cancel", response_model=EventResponse)
 async def cancel_event(
     event_id: UUID,
+    payload: EventCancelRequest | None = None,
     event: Event = Depends(require_event_owner),
     actor: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+    provider: EmailProvider = Depends(get_email_provider),
 ) -> EventResponse:
-    await service.cancel_event(db, actor, event)
+    """Cancel the event, invalidate tickets, refund paid orders, notify buyers.
+
+    Orders are processed in committed batches; calling this again on an
+    already-cancelled event resumes any unfinished work and never refunds or
+    notifies twice. Progress: GET /events/{event_id}/cancellation.
+    """
+    event = await refunds.cancel_event(
+        db, actor, event,
+        reason=payload.reason if payload else None,
+        batch_size=settings.event_cancellation_batch_size,
+    )
+    await _flush_outbox(db, settings, provider)
     return await _event_detail(db, event)
+
+
+@router.get("/{event_id}/cancellation", response_model=EventCancellationSummary)
+async def get_event_cancellation(
+    event: Event = Depends(require_event_owner),
+    db: AsyncSession = Depends(get_db),
+) -> EventCancellationSummary:
+    return EventCancellationSummary(**await refunds.cancellation_summary(db, event))
+
+
+# ---------- Refund policy ----------
+
+
+@router.get("/{event_id}/refund-policy", response_model=RefundPolicyResponse)
+async def get_refund_policy(
+    event_id: UUID,
+    user: User | None = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+) -> RefundPolicyResponse:
+    event = await service.get_visible_event(db, event_id, user)
+    return RefundPolicyResponse(**refunds.policy_view(event))
+
+
+@router.put("/{event_id}/refund-policy", response_model=RefundPolicyResponse)
+async def update_refund_policy(
+    payload: RefundPolicyUpdate,
+    event: Event = Depends(require_event_owner),
+    actor: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> RefundPolicyResponse:
+    await refunds.update_refund_policy(
+        db, actor, event,
+        refunds_enabled=payload.refunds_enabled,
+        refund_deadline_hours=payload.refund_deadline_hours,
+        policy_text=payload.policy_text,
+        fields=set(payload.model_fields_set),
+    )
+    return RefundPolicyResponse(**refunds.policy_view(event))
+
+
+# ---------- Audit log (read-only) ----------
+
+
+@router.get("/{event_id}/audit-log", response_model=list[AuditEntryResponse])
+async def list_event_audit_log(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    action: str | None = Query(default=None, max_length=100),
+    event: Event = Depends(require_event_owner),
+    db: AsyncSession = Depends(get_db),
+) -> list[AuditEntryResponse]:
+    """Append-only trail for this event. There is deliberately no write route."""
+    entries = await repo.list_event_audit_entries(
+        db, event.id, limit=limit, offset=offset, action=action
+    )
+    return [
+        AuditEntryResponse(
+            id=entry.id, timestamp=entry.created_at, actor_id=entry.actor_user_id,
+            actor_type=entry.actor_type, action=entry.action,
+            entity_type=entry.entity_type, entity_id=entry.entity_id,
+            event_id=entry.event_id, metadata=entry.meta, before=entry.before_data,
+            after=entry.after_data, request_id=entry.request_id,
+        )
+        for entry in entries
+    ]
 
 
 # ---------- Paid-sales activation (per event) ----------

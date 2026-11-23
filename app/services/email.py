@@ -8,6 +8,7 @@ from email_validator import EmailNotValidError, validate_email
 
 from app.core.config import Settings, get_settings
 from app.services.email_templates import (
+    render_notification_email,
     render_order_confirmation_email,
     render_password_reset_email,
     render_verification_email,
@@ -32,6 +33,24 @@ class OrderConfirmationEmail:
     event_starts_at: datetime
     venue: str | None
     tickets: list[EmailTicket] = field(default_factory=list)
+    locale: str = "en"
+
+
+@dataclass(frozen=True)
+class NotificationEmail:
+    """Lifecycle notification (payment failed, event updated/cancelled, refund).
+
+    ``details`` holds display-ready strings only: no payment credentials,
+    tokens or other customers' data.
+    """
+
+    email: str
+    kind: str
+    order_number: int
+    event_name: str
+    event_starts_at: datetime
+    venue: str | None
+    details: dict[str, str] = field(default_factory=dict)
     locale: str = "en"
 
 
@@ -83,6 +102,9 @@ class EmailProvider(Protocol):
     async def send_order_confirmation(self, message: OrderConfirmationEmail) -> None:
         ...
 
+    async def send_notification(self, message: NotificationEmail) -> None:
+        ...
+
     async def aclose(self) -> None:
         ...
 
@@ -99,6 +121,7 @@ class DevEmailProvider:
         self._last_codes: dict[str, str] = {}
         self._last_reset_tokens: dict[str, str] = {}
         self._order_confirmations: list[OrderConfirmationEmail] = []
+        self._notifications: list[NotificationEmail] = []
 
     async def send_verification_code(self, *, email: str, code: str, locale: str = "en") -> None:
         self._last_codes[email] = code
@@ -134,6 +157,13 @@ class DevEmailProvider:
 
     def order_confirmations(self) -> list[OrderConfirmationEmail]:
         return list(self._order_confirmations)
+
+    async def send_notification(self, message: NotificationEmail) -> None:
+        self._notifications.append(message)
+        logger.info("%s notification for order #%s", message.kind, message.order_number)
+
+    def notifications(self, kind: str | None = None) -> list[NotificationEmail]:
+        return [m for m in self._notifications if kind is None or m.kind == kind]
 
     async def aclose(self) -> None:
         return None
@@ -334,6 +364,16 @@ class BrevoEmailProvider:
             html=content.html,
         )
         await self._post(payload, kind="order confirmation")
+
+    async def send_notification(self, message: NotificationEmail) -> None:
+        content = render_notification_email(message)
+        payload = self._payload(
+            to_email=message.email,
+            subject=content.subject,
+            text=content.text,
+            html=content.html,
+        )
+        await self._post(payload, kind=message.kind.lower().replace("_", " "))
 
 
 def build_email_provider(settings: Settings | None = None) -> EmailProvider:
