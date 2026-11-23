@@ -2,7 +2,7 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.tickets import TicketResponse
 
@@ -13,8 +13,24 @@ class OrderItemRequest(BaseModel):
 
 
 class OrderCreateRequest(BaseModel):
+    """Checkout request.
+
+    Only ticket selections and an optional promotion are accepted; prices,
+    discounts, fees and totals are always calculated by the server. Unknown
+    fields (e.g. a client-supplied ``total_amount``) are ignored.
+    """
+
     event_id: UUID
     items: list[OrderItemRequest] = Field(min_length=1, max_length=20)
+    promo_code: str | None = Field(default=None, min_length=1, max_length=40)
+    # Opaque token from a campaign QR link (alternative to typing a code).
+    campaign_token: UUID | None = None
+
+    @model_validator(mode="after")
+    def _single_promotion(self) -> "OrderCreateRequest":
+        if self.promo_code is not None and self.campaign_token is not None:
+            raise ValueError("Provide either promo_code or campaign_token, not both")
+        return self
 
 
 OrderItemCreate = OrderItemRequest
@@ -46,6 +62,8 @@ class OrderResponse(BaseModel):
     fee_amount: Decimal
     total_amount: Decimal
     is_free: bool
+    campaign_id: UUID | None = None
+    promo_code: str | None = None
     expires_at: datetime | None
     paid_at: datetime | None
     cancelled_at: datetime | None

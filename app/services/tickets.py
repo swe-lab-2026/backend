@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import cast
@@ -62,6 +63,20 @@ def hash_qr_payload(payload: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+_CAMPAIGN_LINK_RE = re.compile(
+    r"/campaigns/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/?$"
+)
+
+
+def _campaign_token_candidate(payload: str) -> UUID | None:
+    match = _CAMPAIGN_LINK_RE.search(payload)
+    candidate = match.group(1) if match else payload
+    try:
+        return UUID(candidate)
+    except ValueError:
+        return None
+
+
 def _verify_qr_payload(payload: str, secret: str) -> UUID:
     parts = payload.strip().split(".")
     if len(parts) != 3 or parts[0] != _QR_VERSION:
@@ -101,13 +116,11 @@ async def _resolve_ticket(
             return ticket
         raise ApiError(401, "INVALID_TICKET_QR", "Invalid ticket QR code")
 
-    # Campaign tokens are promotional links, never admission credentials. A
-    # campaign token is a bare UUID, so reject it explicitly before the legacy
-    # opaque-token lookup instead of relying on it not matching a ticket hash.
-    try:
-        campaign_token = UUID(payload)
-    except ValueError:
-        campaign_token = None
+    # Campaign QR codes are promotional links, never admission credentials.
+    # They encode either a bare token or ``https://<web>/campaigns/<token>``;
+    # reject both forms explicitly before the legacy opaque-token lookup
+    # instead of relying on them not matching a ticket hash.
+    campaign_token = _campaign_token_candidate(payload)
     if campaign_token is not None:
         campaign = await repo.get_campaign_by_token(db, campaign_token)
         if campaign is not None:
@@ -116,6 +129,9 @@ async def _resolve_ticket(
                 "CAMPAIGN_QR_NOT_ADMISSION",
                 "Campaign QR codes cannot be used for admission",
             )
+    if _CAMPAIGN_LINK_RE.search(payload) or payload.lower().startswith(("http://", "https://")):
+        # A link is never an admission credential; skip the hash lookup.
+        raise ApiError(401, "INVALID_TICKET_QR", "Invalid ticket QR code")
 
     ticket = await repo.get_ticket_by_qr_hash(db, hash_qr_payload(payload))
     if ticket is None:

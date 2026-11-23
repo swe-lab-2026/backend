@@ -25,8 +25,10 @@ from app.db.models import (
     User,
     UserRole,
 )
+from app.schemas.campaigns import PricedLineResponse, PromoQuoteResponse, PromoValidateRequest
 from app.schemas.orders import OrderCreate, OrderItemResponse, OrderResponse
 from app.schemas.tickets import TicketResponse
+from app.services import campaigns as campaign_service
 from app.services import notifications
 from app.services import tickets as ticket_service
 from app.services.events import as_utc
@@ -35,6 +37,14 @@ logger = logging.getLogger("app.orders")
 
 DEFAULT_RESERVATION_TTL_MINUTES = 10
 _COMMITTED_STATUSES = {OrderStatus.PAID, OrderStatus.CONFIRMED}
+PROCESSING_FEE_RATE = Decimal("0.03")
+
+
+def calculate_processing_fee(payable: Decimal) -> Decimal:
+    """3% processing fee on the discounted amount, rounded to tiyn."""
+    if payable <= 0:
+        return Decimal("0.00")
+    return (payable * PROCESSING_FEE_RATE).quantize(Decimal("0.01"))
 
 
 def _now() -> datetime:
@@ -52,7 +62,7 @@ async def expire_holds(db: AsyncSession) -> int:
         )
         .values(status=HoldStatus.EXPIRED, updated_at=now)
     )
-    await db.execute(
+    expired = await db.execute(
         update(Order)
         .where(
             Order.status == OrderStatus.PENDING,
@@ -60,7 +70,10 @@ async def expire_holds(db: AsyncSession) -> int:
             Order.expires_at <= now,
         )
         .values(status=OrderStatus.EXPIRED, updated_at=now)
+        .returning(Order.id)
     )
+    # Abandoned checkouts must not keep promo capacity.
+    await campaign_service.release_redemptions(db, list(expired.scalars().all()))
     return cast(CursorResult, result).rowcount or 0
 
 
@@ -125,8 +138,14 @@ async def create_order(
         event_id = payload.event_id
         items = payload.items
 
-    await expire_holds(db)
+    promo_code = None if isinstance(payload, UUID) else payload.promo_code
+    campaign_token = None if isinstance(payload, UUID) else payload.campaign_token
+
+    # Lock the event first: every checkout for an event serializes here, and
+    # expire_holds (which may release campaign capacity) then runs under that
+    # lock, keeping lock order event -> campaign for all checkout paths.
     event = await _lock_event(db, event_id)
+    await expire_holds(db)
     now = _now()
 
     registration_start = as_utc(event.registration_starts_at)
@@ -219,9 +238,8 @@ async def create_order(
                 },
             )
 
-    is_free = subtotal == Decimal("0.00")
-    processing_fee = Decimal("0.00")
-    if not is_free:
+    has_priced_items = subtotal > Decimal("0.00")
+    if has_priced_items:
         if currencies != {"KZT"}:
             raise ApiError(409, "UNSUPPORTED_CURRENCY",
                            "Paid checkout currently supports KZT ticket types only")
@@ -229,14 +247,42 @@ async def create_order(
         if activation is None or activation.activated_at is None:
             raise ApiError(409, "PAID_SALES_NOT_ACTIVATED",
                            "Paid ticket sales are not activated for this event")
-        # Processing fee is calculated by the backend (3%, rounded to tiyn).
-        processing_fee = (subtotal * Decimal("0.03")).quantize(Decimal("0.01"))
+    currency = next(iter(currencies)) if has_priced_items else "KZT"
+
+    campaign = None
+    discount = None
+    if promo_code is not None or campaign_token is not None:
+        campaign = await campaign_service.find_for_checkout(
+            db, event_id=event.id, code=promo_code, campaign_token=campaign_token
+        )
+        discount = campaign_service.calculate_discount(
+            discount_type=campaign.discount_type,
+            discount_value=campaign.discount_value,
+            lines=[
+                campaign_service.PriceLine(ticket_type.id, ticket_type.price, quantity)
+                for ticket_type, quantity in prepared
+            ],
+            applicable=set(
+                await campaign_service.applicable_ticket_type_ids(db, campaign.id)
+            ),
+            currency=currency,
+        )
+        await campaign_service.ensure_no_active_reservation(
+            db, campaign_id=campaign.id, user_id=user.id
+        )
+        # Authoritative, concurrency-safe capacity check (conditional UPDATE).
+        await campaign_service.reserve_capacity(db, campaign)
+
+    discount_total = discount.total if discount else Decimal("0.00")
+    payable = subtotal - discount_total
+    is_free = payable == Decimal("0.00")
+    # Processing fee is calculated by the backend on the discounted amount.
+    processing_fee = calculate_processing_fee(payable)
     expires_at = (
         None
         if is_free
         else now + timedelta(minutes=max(1, reservation_ttl_minutes))
     )
-    currency = "KZT" if is_free else next(iter(currencies))
     order = Order(
         event_id=event_id,
         buyer_user_id=user.id,
@@ -244,14 +290,25 @@ async def create_order(
         status=OrderStatus.PAID if is_free else OrderStatus.PENDING,
         currency=currency,
         subtotal_amount=subtotal,
-        discount_amount=Decimal("0.00"),
+        discount_amount=discount_total,
         fee_amount=processing_fee,
-        total_amount=subtotal + processing_fee,
+        total_amount=payable + processing_fee,
+        campaign_id=campaign.id if campaign else None,
+        promo_code_snapshot=campaign.promo_code if campaign else None,
         expires_at=expires_at,
         paid_at=now if is_free else None,
     )
     db.add(order)
     await db.flush()
+    if campaign is not None:
+        await campaign_service.record_redemption(
+            db,
+            campaign_id=campaign.id,
+            order_id=order.id,
+            user_id=user.id,
+            discount_amount=discount_total,
+            completed=is_free,
+        )
 
     attendee = Attendee(
         user_id=user.id,
@@ -264,7 +321,11 @@ async def create_order(
 
     order_items: list[OrderItem] = []
     for ticket_type, quantity in prepared:
-        for _ in range(quantity):
+        unit_discounts = list(discount.per_unit.get(ticket_type.id, [])) if discount else []
+        for index in range(quantity):
+            unit_discount = (
+                unit_discounts[index] if index < len(unit_discounts) else Decimal("0.00")
+            )
             order_items.append(
                 OrderItem(
                     order_id=order.id,
@@ -272,8 +333,8 @@ async def create_order(
                     attendee_id=attendee.id,
                     ticket_type_name=ticket_type.name,
                     unit_price=ticket_type.price,
-                    discount_amount=Decimal("0.00"),
-                    final_price=ticket_type.price,
+                    discount_amount=unit_discount,
+                    final_price=ticket_type.price - unit_discount,
                 )
             )
     db.add_all(order_items)
@@ -314,6 +375,8 @@ async def create_order(
         after_data={
             "status": order.status.value,
             "total_amount": str(order.total_amount),
+            "discount_amount": str(order.discount_amount),
+            "campaign_id": str(campaign.id) if campaign else None,
             "is_free": is_free,
             "items": [
                 {"ticket_type_id": str(ticket_type.id), "quantity": quantity}
@@ -361,6 +424,7 @@ async def confirm_order(
     order.expires_at = None
     order.updated_at = now
     await db.flush()
+    await campaign_service.complete_redemption(db, order.id)
 
     await ticket_service.ensure_order_tickets(db, order, qr_secret=qr_secret)
     await notifications.enqueue_order_confirmation(db, order_id=order.id)
@@ -424,6 +488,8 @@ async def cancel_order(db: AsyncSession, user: User, order_id: UUID) -> Order:
             hold.status = HoldStatus.RELEASED
             hold.updated_at = now
 
+    released = await campaign_service.release_redemptions(db, [order.id])
+
     order.status = OrderStatus.CANCELLED
     order.cancelled_at = now
     order.updated_at = now
@@ -435,7 +501,7 @@ async def cancel_order(db: AsyncSession, user: User, order_id: UUID) -> Order:
         entity_type="order",
         entity_id=order.id,
         action="order.cancelled",
-        after_data={"status": order.status.value},
+        after_data={"status": order.status.value, "promo_redemption_released": bool(released)},
     )
     return order
 
@@ -553,6 +619,8 @@ async def build_order_response(
         fee_amount=order.fee_amount,
         total_amount=order.total_amount,
         is_free=order.total_amount == 0,
+        campaign_id=order.campaign_id,
+        promo_code=order.promo_code_snapshot,
         expires_at=order.expires_at,
         paid_at=order.paid_at,
         cancelled_at=order.cancelled_at,
@@ -560,4 +628,75 @@ async def build_order_response(
         updated_at=order.updated_at,
         items=item_responses,
         tickets=tickets,
+    )
+
+
+async def quote_promotion(db: AsyncSession, payload: PromoValidateRequest) -> PromoQuoteResponse:
+    """Preview a promo code against a ticket selection.
+
+    Uses exactly the checkout pricing functions but takes no locks and writes
+    nothing, so validating or previewing never consumes a redemption.
+    Inventory availability is still checked at checkout.
+    """
+    event = await repo.get_event_by_id(db, payload.event_id)
+    if event is None or event.status != EventStatus.PUBLISHED:
+        raise ApiError(404, "EVENT_NOT_AVAILABLE", "Event is not available for registration")
+
+    quantities: dict[UUID, int] = {}
+    for item in payload.items:
+        quantities[item.ticket_type_id] = quantities.get(item.ticket_type_id, 0) + item.quantity
+
+    lines: list[campaign_service.PriceLine] = []
+    currencies: set[str] = set()
+    for ticket_type_id, quantity in sorted(quantities.items(), key=lambda pair: str(pair[0])):
+        ticket_type = await repo.get_ticket_type_for_event(
+            db, event_id=event.id, ticket_type_id=ticket_type_id
+        )
+        if ticket_type is None or ticket_type.is_hidden:
+            raise ApiError(400, "INVALID_TICKET_TYPE", "One or more ticket types are unavailable")
+        lines.append(campaign_service.PriceLine(ticket_type.id, ticket_type.price, quantity))
+        currencies.add(ticket_type.currency)
+    if len(currencies) > 1:
+        raise ApiError(409, "CURRENCY_MISMATCH", "Selected ticket types use different currencies")
+
+    subtotal = sum((line.unit_price * line.quantity for line in lines), Decimal("0.00"))
+    currency = next(iter(currencies)) if subtotal > 0 else "KZT"
+    campaign = await campaign_service.find_for_checkout(
+        db, event_id=event.id, code=payload.code, campaign_token=payload.campaign_token
+    )
+    discount = campaign_service.calculate_discount(
+        discount_type=campaign.discount_type,
+        discount_value=campaign.discount_value,
+        lines=lines,
+        applicable=set(await campaign_service.applicable_ticket_type_ids(db, campaign.id)),
+        currency=currency,
+    )
+    payable = subtotal - discount.total
+    fee = calculate_processing_fee(payable)
+    return PromoQuoteResponse(
+        campaign_id=campaign.id,
+        code=campaign.promo_code,
+        discount_type=campaign.discount_type.value,
+        discount_value=campaign.discount_value,
+        currency=currency,
+        subtotal=subtotal,
+        eligible_subtotal=discount.eligible_subtotal,
+        discount_amount=discount.total,
+        fee_amount=fee,
+        final_total=payable + fee,
+        lines=[
+            PricedLineResponse(
+                ticket_type_id=line.ticket_type_id,
+                quantity=line.quantity,
+                unit_price=line.unit_price,
+                subtotal=line.unit_price * line.quantity,
+                discount_amount=sum(
+                    discount.per_unit.get(line.ticket_type_id, []), Decimal("0.00")
+                ),
+                total=line.unit_price * line.quantity
+                - sum(discount.per_unit.get(line.ticket_type_id, []), Decimal("0.00")),
+                eligible=line.ticket_type_id in discount.eligible_ticket_type_ids,
+            )
+            for line in lines
+        ],
     )
