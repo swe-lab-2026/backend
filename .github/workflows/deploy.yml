@@ -1,0 +1,88 @@
+name: backend-deploy
+
+on:
+  workflow_run:
+    workflows: ["backend-ci"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main' &&
+          vars.CD_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh-keygen -y -f ~/.ssh/id_ed25519 > /dev/null
+          test -s ~/.ssh/known_hosts
+
+      - name: Deploy verified main commit
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_HOST:?Set DEPLOY_HOST variable}"
+          : "${DEPLOY_USER:?Set DEPLOY_USER variable}"
+          : "${DEPLOY_PATH:?Set DEPLOY_PATH variable}"
+          DEPLOY_PORT="${DEPLOY_PORT:-22}"
+          [[ "$DEPLOY_PORT" =~ ^[0-9]+$ ]]
+          [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$DEPLOY_PATH" == /* ]]
+          # Escape values for the remote shell; no secrets go into this command.
+          printf -v quoted_path '%q' "$DEPLOY_PATH"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 \
+            -i ~/.ssh/id_ed25519 -p "$DEPLOY_PORT" \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "bash -se -- $quoted_path $EXPECTED_SHA" <<'REMOTE'
+          set -euo pipefail
+          deploy_path="$1"
+          expected_sha="$2"
+          cd "$deploy_path"
+          test -f .env
+          git fetch origin main
+          current_main="$(git rev-parse origin/main)"
+          if [ "$current_main" != "$expected_sha" ]; then
+            echo "Skipping stale workflow: main moved after this CI run."
+            exit 0
+          fi
+          git checkout main
+          git merge --ff-only origin/main
+          # Existing named PostgreSQL and Redis volumes are retained.
+          docker compose up -d --build --wait
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent --show-error --max-time 3 \
+              http://127.0.0.1:8000/ >/dev/null 2>&1; then
+              echo "Deployment health check passed: $expected_sha"
+              exit 0
+            fi
+            sleep 3
+          done
+          docker compose ps
+          docker compose logs --tail=100 api
+          echo "Deployment health check failed" >&2
+          exit 1
+          REMOTE
