@@ -1,4 +1,5 @@
 import logging
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
@@ -18,6 +19,7 @@ from app.db.models import (
     UserRole,
 )
 from app.schemas.events import EventCreate, EventImageInput, EventUpdate
+from app.services import notifications
 
 logger = logging.getLogger("app.events")
 
@@ -215,6 +217,20 @@ async def update_event(
 
     event.updated_at = _now()
 
+    # Tell ticket holders about material changes (SCRUM-14). Queued in the
+    # outbox inside this transaction; one email per order per update.
+    changed = [
+        field
+        for field in notifications.EVENT_UPDATE_NOTIFY_FIELDS
+        if field in before and before[field] != after[field]
+    ]
+    if changed and event.status == EventStatus.PUBLISHED:
+        notified = await notifications.enqueue_event_updated(
+            db, event, changed, update_key=f"update:{uuid.uuid4()}"
+        )
+        if notified:
+            after["notified_orders"] = notified
+
     if before or after:
         await repo.add_audit_entry(
             db,
@@ -382,19 +398,32 @@ async def unpublish_event(
     return event
 
 
-async def cancel_event(db: AsyncSession, actor: User, event: Event) -> Event:
+async def cancel_event(
+    db: AsyncSession,
+    actor: User,
+    event: Event,
+    *,
+    actor_type: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Event:
+    """Lifecycle transition only; order processing lives in services.refunds."""
+    previous = event.status
     _transition_to(event, EventStatus.CANCELLED)
     event.status = EventStatus.CANCELLED
     event.updated_at = _now()
+    event.cancelled_at = event.cancelled_at or event.updated_at
 
     await repo.add_audit_entry(
         db,
         actor_user_id=actor.id,
+        actor_type=actor_type,
         event_id=event.id,
         entity_type="event",
         entity_id=event.id,
         action="event.cancelled",
+        before_data={"status": previous.value},
         after_data={"status": event.status.value},
+        metadata=metadata,
     )
     logger.info("event %s cancelled by %s", event.id, actor.id)
     return event

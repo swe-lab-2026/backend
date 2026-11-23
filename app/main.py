@@ -31,7 +31,7 @@ from app.core.logging import RequestContextMiddleware, configure_logging
 from app.db.schema import apply_schema
 from app.db.session import create_engine_and_session_factory
 from app.kv.store import MemoryTTLStore, RedisTTLStore, TTLStore
-from app.services import notifications
+from app.services import notifications, refunds
 from app.services import orders as order_service
 from app.services.email import EmailProvider, build_email_provider
 
@@ -71,6 +71,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 try:
                     async with session_factory() as session:
                         await order_service.expire_holds(session)
+                        await session.commit()
+                    # Finish event cancellations interrupted mid-way (crash,
+                    # timeout). Idempotent: closed orders are skipped.
+                    async with session_factory() as session:
+                        await refunds.resume_event_cancellations(
+                            session, batch_size=settings.event_cancellation_batch_size
+                        )
                         await session.commit()
                 except asyncio.CancelledError:
                     raise

@@ -239,6 +239,26 @@ async def touch_refresh_session(session: AsyncSession, session_id: UUID) -> None
 
 # ---------- Audit ----------
 
+_AUDIT_FORBIDDEN_KEYS = (
+    "password", "token", "secret", "api_key", "authorization", "card", "cvv", "iban",
+)
+
+
+def _scrub(data: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Drop keys that look like credentials or payment secrets (defence in depth)."""
+    if data is None:
+        return None
+    clean: dict[str, Any] = {}
+    for key, value in data.items():
+        lowered = key.lower()
+        if any(marker in lowered for marker in _AUDIT_FORBIDDEN_KEYS) and lowered not in (
+            "campaign_token",
+        ):
+            continue
+        clean[key] = _scrub(value) if isinstance(value, dict) else value
+    return clean
+
+
 async def add_audit_entry(
     session: AsyncSession,
     *,
@@ -250,18 +270,45 @@ async def add_audit_entry(
     after_data: dict[str, Any] | None = None,
     ip_address: str | None = None,
     event_id: UUID | None = None,
-) -> None:
+    actor_type: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> AuditLog:
+    """Append an audit entry in the caller's transaction.
+
+    The entry commits or rolls back together with the business change it
+    describes. ``actor_type`` defaults to USER for authenticated actors and
+    SYSTEM otherwise; the request id comes from the HTTP middleware.
+    """
+    from app.core.logging import current_request_id
+
     entry = AuditLog(
         actor_user_id=actor_user_id,
+        actor_type=actor_type or ("USER" if actor_user_id is not None else "SYSTEM"),
         event_id=event_id,
         entity_type=entity_type,
         entity_id=entity_id,
         action=action,
-        before_data=before_data,
-        after_data=after_data,
+        before_data=_scrub(before_data),
+        after_data=_scrub(after_data),
+        meta=_scrub(metadata),
+        request_id=current_request_id.get(),
         ip_address=ip_address,
     )
     session.add(entry)
+    return entry
+
+
+async def list_event_audit_entries(
+    session: AsyncSession, event_id: UUID, *, limit: int, offset: int,
+    action: str | None = None,
+) -> list[AuditLog]:
+    stmt = select(AuditLog).where(AuditLog.event_id == event_id)
+    if action:
+        stmt = stmt.where(AuditLog.action == action)
+    result = await session.execute(
+        stmt.order_by(AuditLog.created_at.desc(), AuditLog.id.desc()).limit(limit).offset(offset)
+    )
+    return list(result.scalars().all())
 
 
 # ---------- Organizer profiles ----------
@@ -763,10 +810,12 @@ async def get_order_notification(
     order_id: UUID,
     kind: str,
     for_update: bool = False,
+    dedupe_key: str = "",
 ) -> OrderNotification | None:
     stmt = select(OrderNotification).where(
         OrderNotification.order_id == order_id,
         OrderNotification.kind == kind,
+        OrderNotification.dedupe_key == dedupe_key,
     )
     if for_update:
         stmt = stmt.with_for_update()
@@ -775,9 +824,16 @@ async def get_order_notification(
 
 
 async def create_order_notification(
-    session: AsyncSession, *, order_id: UUID, kind: str
+    session: AsyncSession,
+    *,
+    order_id: UUID,
+    kind: str,
+    dedupe_key: str = "",
+    payload: dict[str, Any] | None = None,
 ) -> OrderNotification:
-    notification = OrderNotification(order_id=order_id, kind=kind)
+    notification = OrderNotification(
+        order_id=order_id, kind=kind, dedupe_key=dedupe_key, payload=payload
+    )
     session.add(notification)
     await session.flush()
     return notification
@@ -800,6 +856,21 @@ async def list_retryable_order_notifications(
         )
         .order_by(OrderNotification.created_at.asc())
         .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    return list(result.scalars().all())
+
+
+async def list_order_pending_notifications(
+    session: AsyncSession, order_id: UUID
+) -> list[OrderNotification]:
+    result = await session.execute(
+        select(OrderNotification)
+        .where(
+            OrderNotification.order_id == order_id,
+            OrderNotification.status.in_(("PENDING", "FAILED")),
+        )
+        .order_by(OrderNotification.created_at.asc())
         .with_for_update(skip_locked=True)
     )
     return list(result.scalars().all())

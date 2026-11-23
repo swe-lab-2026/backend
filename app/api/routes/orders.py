@@ -11,15 +11,20 @@ from app.api.deps import (
 )
 from app.core.config import Settings
 from app.db import repositories as repo
-from app.db.models import Order, User
+from app.db.models import Order, Refund, User
 from app.schemas.orders import OrderCreate, OrderResponse
 from app.schemas.paid_sales import (
     PaymentResponse,
     PaymentSimulationResultRequest,
     PaymentSimulationStartResponse,
 )
+from app.schemas.refunds import (
+    RefundEligibilityResponse,
+    RefundResponse,
+    RefundResultResponse,
+)
 from app.schemas.tickets import TicketResponse
-from app.services import notifications, paid_sales
+from app.services import notifications, paid_sales, refunds
 from app.services import orders as order_service
 from app.services.email import EmailProvider
 
@@ -112,6 +117,8 @@ async def resolve_payment_simulation(
             download_base=settings.public_api_base,
         )
         await db.commit()
+    elif payment.status.value == "FAILED":
+        await _deliver_after_commit(db, order.id, settings, provider)
     return PaymentResponse(
         id=payment.id, order_id=payment.order_id, amount=payment.amount,
         currency=payment.currency, status=payment.status.value,
@@ -190,12 +197,84 @@ async def checkout_order(
                    "Use the payment simulation flow to complete paid checkout")
 
 
+async def _deliver_after_commit(
+    db: AsyncSession, order_id: UUID, settings: Settings, provider: EmailProvider
+) -> None:
+    """Commit the business change first, then try the outbox emails.
+
+    Delivery problems never undo the committed state; the retry worker picks
+    up anything left PENDING/FAILED.
+    """
+    await db.commit()
+    await notifications.deliver_pending_for_order(
+        db, order_id=order_id, provider=provider, download_base=settings.public_api_base
+    )
+    await db.commit()
+
+
+def _refund_response(refund: Refund) -> RefundResponse:
+    return RefundResponse(
+        id=refund.id, order_id=refund.order_id, payment_id=refund.payment_id,
+        amount=refund.amount, currency=refund.currency, status=refund.status.value,
+        kind=refund.kind, reason=refund.reason, is_simulated=refund.is_simulated,
+        created_at=refund.created_at, completed_at=refund.completed_at,
+    )
+
+
 @router.post("/{order_id}/cancel", response_model=OrderResponse)
 async def cancel_order(
     order_id: UUID,
     user: User = Depends(require_active_user),
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
+    provider: EmailProvider = Depends(get_email_provider),
 ) -> OrderResponse:
-    order = await order_service.cancel_order(db, user, order_id)
-    return await _response(db, order, settings)
+    """Customer cancellation of their own order.
+
+    Pending checkout -> CANCELLED; free registration -> CANCELLED (no money);
+    paid order -> policy-checked simulated full refund (REFUNDED). Repeating
+    the call returns the current state without processing anything again.
+    """
+    result = await refunds.customer_cancel(db, user, order_id)
+    if not result.replayed:
+        await _deliver_after_commit(db, result.order.id, settings, provider)
+    return await _response(db, result.order, settings)
+
+
+@router.post("/{order_id}/refund", response_model=RefundResultResponse)
+async def refund_order(
+    order_id: UUID,
+    user: User = Depends(require_active_user),
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+    provider: EmailProvider = Depends(get_email_provider),
+) -> RefundResultResponse:
+    """Explicit refund request for a paid order (idempotent)."""
+    result = await refunds.customer_cancel(db, user, order_id, require_refund=True)
+    if not result.replayed:
+        await _deliver_after_commit(db, result.order.id, settings, provider)
+    return RefundResultResponse(
+        order_id=result.order.id,
+        order_status=result.order.status.value,
+        refund=_refund_response(result.refund) if result.refund else None,
+        replayed=result.replayed,
+    )
+
+
+@router.get("/{order_id}/refunds", response_model=list[RefundResponse])
+async def list_order_refunds(
+    order_id: UUID,
+    user: User = Depends(require_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[RefundResponse]:
+    order = await order_service.get_order_for_view(db, user, order_id)
+    return [_refund_response(r) for r in await refunds.list_order_refunds(db, order.id)]
+
+
+@router.get("/{order_id}/refund-eligibility", response_model=RefundEligibilityResponse)
+async def get_refund_eligibility(
+    order_id: UUID,
+    user: User = Depends(require_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> RefundEligibilityResponse:
+    return RefundEligibilityResponse(**await refunds.refund_eligibility(db, user, order_id))
