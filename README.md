@@ -1134,3 +1134,199 @@ backfilled to `actor_type = 'USER'`.
 
 Automated: `make test` (SQLite) or, for the locking, concurrency and trigger
 tests, `TEST_DATABASE_URL=postgresql+asyncpg://… make test`.
+
+## Support cases and asynchronous messages (SCRUM-16)
+
+REST + polling (no WebSockets). Lifecycle history is written to the existing
+append-only `audit_logs`; messages live in `support_messages`; notifications
+are in-app rows in the existing `notifications` table.
+
+### Endpoints
+
+| Method | Path | Who | Purpose |
+|---|---|---|---|
+| `POST` | `/api/v1/support/cases` | any active user | Open a case (`subject`, `category`, `message`, optional `ticket_id` / `order_id` / `event_id`, optional `case_type`) |
+| `GET` | `/api/v1/support/cases` | any active user | Accessible cases only; filters `status` (repeatable), `category`, `case_type`, `event_id`, `escalated`, `assigned_to_me`, `role=requester\|handler`, `q`; `sort`, `limit`, `offset` |
+| `GET` | `/api/v1/support/cases/{id}` | participant | Details + caller's `access` (`relation`, `can_manage`, `can_escalate`) |
+| `GET` | `/api/v1/support/cases/{id}/messages` | participant | Oldest first; `after_sequence` (polling cursor), `before_sequence` (history), `since` (timestamp), `limit` ≤ 100 |
+| `POST` | `/api/v1/support/cases/{id}/messages` | participant | Send a message (1–5000 chars, not blank) |
+| `PATCH` | `/api/v1/support/cases/{id}/status` | participant (see rules) | `{"status", "note"?}` |
+| `PATCH` | `/api/v1/support/cases/{id}/assignee` | handler | `{"assignee_user_id": uuid \| null}` |
+| `GET` | `/api/v1/support/cases/{id}/assignable-users` | handler | Users the case may be assigned to |
+| `POST` | `/api/v1/support/cases/{id}/escalate` | requester, owner, support staff | Escalate an attendee case to Platform Admins (`{"reason"}`) |
+| `GET` | `/api/v1/support/cases/{id}/activity` | participant | Chronological lifecycle history (actor, timestamp, from/to) |
+| `GET` | `/api/v1/users/me/notifications` | self | In-app notifications (`unread_only`, paging, `unread_count`) |
+| `POST` | `/api/v1/users/me/notifications/{id}/read` | self | Mark one read (idempotent) |
+
+### Routing and context
+
+* `ATTENDEE_ORGANIZER`: a customer and the organizer staff of one event. Needs an
+  event/order/ticket the customer owns (an event-only case needs an order for
+  the event or a publicly visible event).
+* `PLATFORM`: an organizer (about their own event, or without context) or any
+  user with an account/technical issue, and Platform Admins.
+* `ticket_id` resolves its order and event; `order_id` resolves its event. Extra
+  identifiers must agree (`422 SUPPORT_CONTEXT_MISMATCH`). Unknown and
+  not-yours references both return `404 SUPPORT_CONTEXT_NOT_FOUND`.
+* Categories: `TICKET_DELIVERY`, `PAYMENT`, `REFUND`, `SEATING`,
+  `EVENT_INFORMATION`, `CHECK_IN`, `ACCOUNT`, `TECHNICAL`.
+
+### Authorization matrix
+
+| Caller | Attendee case (own event context) | Platform case |
+|---|---|---|
+| Requester | full participant (resolve / reopen, message, escalate) | full participant |
+| Event owner | handler | — (only if requester) |
+| `EVENT_ADMIN` / `ORGANIZER_STAFF` of that event | handler | no access |
+| `CHECK_IN_STAFF` | no access | no access |
+| Platform Admin | handler **only after escalation** | handler |
+| Anyone else | `403 SUPPORT_CASE_ACCESS_DENIED`, no metadata | same |
+
+Access is recomputed from PostgreSQL on every request (removing an EventStaff
+row revokes it immediately); the assignee field never grants access by
+itself. Listings put the same rule in the SQL `WHERE`, so inaccessible cases
+are neither returned nor counted.
+
+### Lifecycle
+
+`OPEN → IN_PROGRESS | WAITING_FOR_CUSTOMER | RESOLVED`,
+`IN_PROGRESS → WAITING_FOR_CUSTOMER | RESOLVED`,
+`WAITING_FOR_CUSTOMER → IN_PROGRESS | RESOLVED`,
+`RESOLVED → OPEN | IN_PROGRESS` (reopen). Handlers may make any listed
+transition; the requester may resolve or reopen (`RESOLVED → OPEN`). A
+customer reply on `WAITING_FOR_CUSTOMER` moves the case to `IN_PROGRESS`.
+Messages cannot be posted on a `RESOLVED` case (reopen first).
+
+Assignees: event owner or support staff of the event (plus Platform Admins once
+escalated) for attendee cases; Platform Admins for platform cases. Active
+accounts only.
+
+### Ordering and polling
+
+Each message gets a per-case, gap-free `sequence` under the case row lock, so
+ordering is deterministic even with identical timestamps. Poll with
+`after_sequence=<next_cursor>`; with no new messages `next_cursor` stays the
+same.
+
+### Notifications
+
+In-app (`channel = IN_APP`) for: case created (handlers), new message (the
+other side: assignee if any, otherwise all handlers; or the requester),
+assigned/reassigned (new and previous assignee), significant status changes
+(`WAITING_FOR_CUSTOMER`, `RESOLVED`, reopen), escalation (Platform Admins plus
+the other side). Recipients are intersected with the users currently
+authorized for the case; the actor and blocked accounts are skipped and
+duplicates collapse.
+
+## Administration, analytics and event history (SCRUM-17)
+
+### Platform Admin endpoints (all require `PLATFORM_ADMIN`)
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/v1/admin/users` | Search `q` (email, name, id), `status`, `role`, `is_organizer`, `sort`, paging |
+| `GET` | `/api/v1/admin/users/{id}` | Inspect one user (no password hash or tokens) |
+| `POST` | `/api/v1/admin/users/{id}/suspend` · `/unsuspend` | `{"reason"}`; suspend = status `BLOCKED` + refresh sessions revoked |
+| `GET` | `/api/v1/admin/events` · `/{id}` | Search `q`, `status`, `suspended`, `owner_user_id`, `starts_from/to`, `sort` |
+| `POST` | `/api/v1/admin/events/{id}/suspend` · `/unsuspend` | Suspend a suspicious event |
+| `POST` | `/api/v1/admin/events/{id}/paid-sales/stop` · `/resume` | Stop paid checkout only (free registration continues) |
+| `GET` | `/api/v1/admin/orders` | Search `q` (order number, buyer email, id), `status`, `event_id`, `buyer_user_id`, dates, `sort` |
+| `GET` | `/api/v1/admin/payments` | Search `q` (provider ref, order number, id), `status`, `provider`, `order_id`, `event_id`, dates |
+| `GET` | `/api/v1/admin/activations` | Paid-sales activation records (`NOT_ACTIVATED` / `ACTIVE` / `SUSPENDED`) |
+| `GET` | `/api/v1/admin/refunds` | Refunds by `status`, `kind`, `event_id`, dates |
+| `GET` | `/api/v1/admin/failures` | Failed payments, failed refunds and failed outbox emails (`kind`) |
+| `GET` · `POST` | `/api/v1/admin/disputes` | List / record a dispute against a captured payment |
+| `PATCH` | `/api/v1/admin/disputes/{id}` | `OPEN → UNDER_REVIEW → RESOLVED \| REJECTED` |
+| `GET` | `/api/v1/admin/support/escalated` | Escalated attendee support cases |
+| `GET` | `/api/v1/admin/actions` | Administrative actions from the audit log |
+
+Every administrative action writes an `admin.*` audit entry
+(`actor_type = PLATFORM_ADMIN`) with the target, the admin, the reason
+(`metadata.reason`), the timestamp and `before`/`after` state.
+
+### Suspension enforcement
+
+* **User**: `users.status = BLOCKED`. `get_current_user` re-reads the user on
+  every request, so access tokens issued earlier are rejected with
+  `403 USER_BLOCKED`; refresh sessions are revoked; login is refused.
+* **Event** (`events.suspended_at`, orthogonal to `status`): `POST /orders`, the
+  legacy `/purchase`, holds, promo quotes, starting a payment and completing a
+  pending payment all refuse (`409 EVENT_SUSPENDED`). A pending payment that
+  completes after suspension becomes `FAILED` (`failure_code EVENT_SUSPENDED`);
+  its order is cancelled and holds and promo capacity are released. Publish and
+  duplicate are blocked, and the event is hidden from the catalog, public detail
+  and campaign QR resolution. Existing paid orders, valid tickets, payments and
+  refunds are untouched and keep their lifecycle (refunds still work).
+* **Paid sales stop** (`event_sales_activations.sales_suspended_at`): paid
+  checkout and payment completion fail with `PAID_SALES_SUSPENDED`; re-running
+  the activation checklist cannot lift it; free registration continues.
+
+### Disputes
+
+No payment provider exists, so `payment_disputes` is a minimal bookkeeping
+entity recorded by Platform Admins against captured payments (one open dispute
+per payment). It never changes payments, orders or refunds; money only moves
+through the refund flow.
+
+### Organizer analytics
+
+* `GET /api/v1/events/{event_id}/analytics`: event owner, Platform Admin, or
+  event staff with `permissions.view_analytics = true`. Default Event Admin
+  permissions do not include analytics.
+* `GET /api/v1/organizers/me/analytics`: aggregated over events the caller owns
+  or has `view_analytics` on (relationship based; a global role does not widen
+  it). Optional `event_id`, `ticket_type_id`, `start`, `end`.
+
+Filters: `start` inclusive, `end` exclusive, UTC when no offset; `end <= start`
+gives `422 INVALID_DATE_RANGE`. Every reference is authorized before
+aggregation: a foreign `event_id` gives 403, a foreign/unknown `ticket_type_id`
+gives 404. All metrics are SQL aggregates over authoritative rows (no locks, a
+fixed number of queries). The response includes `definitions`.
+
+| Metric | Formula and time basis |
+|---|---|
+| `capacity.total_capacity` | Σ min(event capacity, Σ ticket type capacity); snapshot |
+| `capacity.sold_tickets` | order items of `PAID`/`CONFIRMED` orders; snapshot |
+| `capacity.reserved_tickets` | active, unexpired holds; snapshot |
+| `capacity.remaining_tickets` | capacity − sold − reserved (≥ 0); snapshot |
+| `attendance.checked_in` | tickets in `CHECKED_IN` (reversal returns to `VALID`; repeated scans are rejected); snapshot |
+| `attendance.eligible_tickets` | `VALID` + `CHECKED_IN` (cancelled/refunded excluded) |
+| `attendance.attendance_rate` | checked_in / eligible_tickets |
+| `attendance.period_*` | check-in/reversal records by `created_at`; admitted = distinct `CHECKED_IN` tickets by `checked_in_at` |
+| `sales[].tickets_sold`, `orders` | items/orders with `paid_at` in range (payment confirmation; pending/failed never have `paid_at`) |
+| `sales[].gross_ticket_sales` | Σ `unit_price` |
+| `sales[].discounts` | Σ item `discount_amount` (already inside revenue; never subtracted twice) |
+| `sales[].ticket_revenue` | Σ `final_price` |
+| `sales[].fees` | Σ `fee_amount` (null with a ticket type filter) |
+| `sales[].gross_revenue` | Σ `total_amount` charged = ticket_revenue + fees |
+| `sales[].refunds` | Σ `SUCCEEDED` refund amounts by `completed_at` |
+| `sales[].net_revenue` | gross_revenue − refunds |
+| `campaigns[]` | redemption counts (snapshot) and attributed orders/tickets/discounts/revenue by `paid_at` |
+
+Money is grouped per currency and never combined.
+
+### Event history and timeline
+
+* `GET /api/v1/organizers/me/events`: events the caller owns or is
+  `EVENT_ADMIN`/`ORGANIZER_STAFF` of. `category` (repeatable): `CANCELLED`
+  (status), `COMPLETED` (status `COMPLETED` or ended), `ACTIVE` (started, not
+  ended), `UPCOMING` (not started). Suspension is reported as `is_suspended` and
+  never changes the category. Also `status`, `q`, `suspended`,
+  `starts_from/to`, `sort`, paging.
+* `GET /api/v1/events/{event_id}/timeline` (owner or Platform Admin): the
+  event's entries in the append-only audit log, newest first (`order=asc`
+  available). `action` filters are repeatable (exact, or a prefix ending in `.`
+  or `.*`); `entity_type`, `start`/`end` and paging are also available. Each
+  entry has actor (id, type, name), timestamp, action, entity type/id and a
+  redacted description (no raw payloads). Access-denied probes are excluded,
+  and nothing is synthesized for actions that were never recorded.
+
+### Migration
+
+`sql/migrate_009_support_admin_analytics.sql` (in the default `SCHEMA_FILES`):
+support routing/escalation/resolution columns, the `WAITING_FOR_CUSTOMER` enum
+value, the message `sequence`/`sender_role` columns (backfilled by
+`created_at, id`), legacy category normalization (originals kept in
+`audit_logs`), user/event/paid-sales suspension columns, the
+`payment_disputes` table, and read-path indexes. Additive; nothing is dropped.
+Apply with `make migrate` (or on startup).

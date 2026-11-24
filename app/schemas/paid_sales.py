@@ -14,6 +14,12 @@ class EventActivationResponse(BaseModel):
     terms_accepted: bool
     is_activated: bool
     activated_at: datetime | None
+    # SCRUM-17: platform controls. Paid checkout requires paid_sales_open.
+    sales_suspended: bool = False
+    sales_suspended_at: datetime | None = None
+    sales_suspension_reason: str | None = None
+    event_suspended: bool = False
+    paid_sales_open: bool = False
 
 
 class TermsAcceptanceRequest(BaseModel):

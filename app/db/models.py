@@ -230,8 +230,40 @@ class CheckinAction(PyEnum):
 class SupportCaseStatus(PyEnum):
     OPEN = "OPEN"
     IN_PROGRESS = "IN_PROGRESS"
+    WAITING_FOR_CUSTOMER = "WAITING_FOR_CUSTOMER"
     RESOLVED = "RESOLVED"
+    # Legacy value from migrate_001; never set by the application.
     CLOSED = "CLOSED"
+
+
+class SupportCaseType(PyEnum):
+    """Routing of a support case (stored as VARCHAR + CHECK).
+
+    ATTENDEE_ORGANIZER: a customer talks to the organizer staff of one event.
+    PLATFORM: an organizer (or any user with an account/technical issue)
+              talks to Platform Admins.
+    """
+
+    ATTENDEE_ORGANIZER = "ATTENDEE_ORGANIZER"
+    PLATFORM = "PLATFORM"
+
+
+class SupportCategory(PyEnum):
+    TICKET_DELIVERY = "TICKET_DELIVERY"
+    PAYMENT = "PAYMENT"
+    REFUND = "REFUND"
+    SEATING = "SEATING"
+    EVENT_INFORMATION = "EVENT_INFORMATION"
+    CHECK_IN = "CHECK_IN"
+    ACCOUNT = "ACCOUNT"
+    TECHNICAL = "TECHNICAL"
+
+
+class DisputeStatus(PyEnum):
+    OPEN = "OPEN"
+    UNDER_REVIEW = "UNDER_REVIEW"
+    RESOLVED = "RESOLVED"
+    REJECTED = "REJECTED"
 
 
 class NotificationChannel(PyEnum):
@@ -273,11 +305,18 @@ class User(Base):
         Enum(UserStatus, name="user_status"), nullable=False, default=UserStatus.ACTIVE
     )
     email_verified_at: Mapped[datetime | None] = mapped_column(TimestampTz)
+    # SCRUM-17: current suspension (status BLOCKED). History lives in audit_logs.
+    suspended_at: Mapped[datetime | None] = mapped_column(TimestampTz)
+    suspended_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    suspension_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
 
     __table_args__ = (
         CheckConstraint("length(trim(email)) > 0", name="users_email_not_blank"),
+        Index("idx_users_created", text("created_at DESC")),
     )
 
 
@@ -446,6 +485,13 @@ class Event(Base):
     refund_deadline_hours: Mapped[int | None] = mapped_column(Integer)
     cancelled_at: Mapped[datetime | None] = mapped_column(TimestampTz)
     cancellation_reason: Mapped[str | None] = mapped_column(Text)
+    # SCRUM-17: administrative suspension. Orthogonal to ``status`` so a
+    # suspended event keeps its lifecycle state (and is never "cancelled").
+    suspended_at: Mapped[datetime | None] = mapped_column(TimestampTz)
+    suspended_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    suspension_reason: Mapped[str | None] = mapped_column(Text)
     published_at: Mapped[datetime | None] = mapped_column(TimestampTz)
     created_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
@@ -475,6 +521,12 @@ class Event(Base):
             postgresql_where=text("visibility = 'PUBLIC' AND status = 'PUBLISHED'"),
         ),
         Index("idx_events_owner", "owner_user_id", text("created_at DESC")),
+        Index(
+            "idx_events_suspended",
+            text("suspended_at DESC"),
+            postgresql_where=text("suspended_at IS NOT NULL"),
+        ),
+        Index("idx_events_starts", "starts_at"),
     )
 
 
@@ -661,6 +713,13 @@ class EventSalesActivation(Base):
     activation_fee_paid_at: Mapped[datetime | None] = mapped_column(TimestampTz)
     terms_accepted_at: Mapped[datetime | None] = mapped_column(TimestampTz)
     activated_at: Mapped[datetime | None] = mapped_column(TimestampTz)
+    # SCRUM-17: Platform Admin stop of paid sales. Free registration is not
+    # affected; the activation itself is kept so resuming restores sales.
+    sales_suspended_at: Mapped[datetime | None] = mapped_column(TimestampTz)
+    sales_suspended_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    sales_suspension_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
 
@@ -724,6 +783,13 @@ class Order(Base):
             "campaign_id",
             postgresql_where=text("campaign_id IS NOT NULL"),
         ),
+        Index(
+            "idx_orders_event_paid",
+            "event_id",
+            "paid_at",
+            postgresql_where=text("paid_at IS NOT NULL"),
+        ),
+        Index("idx_orders_created", text("created_at DESC")),
     )
 
 
@@ -769,6 +835,11 @@ class OrderNotification(Base):
             "status",
             "created_at",
             postgresql_where=text("status IN ('PENDING', 'FAILED')"),
+        ),
+        Index(
+            "idx_order_notifications_failed",
+            text("updated_at DESC"),
+            postgresql_where=text("status = 'FAILED'"),
         ),
     )
 
@@ -895,6 +966,7 @@ class Payment(Base):
         CheckConstraint("amount > 0", name="payments_amount_positive"),
         UniqueConstraint("provider", "provider_payment_ref", name="uq_payments_provider_ref"),
         Index("idx_payments_order", "order_id"),
+        Index("idx_payments_status_created", "status", text("created_at DESC")),
         Index(
             "uq_simulated_payment_per_order",
             "order_id",
@@ -938,6 +1010,7 @@ class Refund(Base):
             "kind IN ('CUSTOMER_REQUEST', 'EVENT_CANCELLATION')", name="refunds_kind_valid"
         ),
         Index("idx_refunds_order", "order_id"),
+        Index("idx_refunds_status_created", "status", text("created_at DESC")),
         # Full refunds only: at most one non-failed refund per payment, so a
         # repeated or concurrent request can never pay out twice.
         Index(
@@ -1049,6 +1122,11 @@ class SupportCase(Base):
     ticket_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("tickets.id", ondelete="SET NULL")
     )
+    # SupportCaseType value; stored as VARCHAR + CHECK.
+    case_type: Mapped[str] = mapped_column(
+        String(30), nullable=False, default=SupportCaseType.PLATFORM.value
+    )
+    # SupportCategory value; stored as VARCHAR + CHECK.
     category: Mapped[str] = mapped_column(String(80), nullable=False)
     subject: Mapped[str] = mapped_column(String(240), nullable=False)
     status: Mapped[SupportCaseStatus] = mapped_column(
@@ -1056,12 +1134,52 @@ class SupportCase(Base):
         nullable=False,
         default=SupportCaseStatus.OPEN,
     )
+    # Attendee cases escalated to Platform Admins (SCRUM-16).
+    escalated_at: Mapped[datetime | None] = mapped_column(TimestampTz)
+    escalated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    escalation_reason: Mapped[str | None] = mapped_column(Text)
+    resolved_at: Mapped[datetime | None] = mapped_column(TimestampTz)
     created_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
+    # Legacy column from migrate_001 (CLOSED status); not set by the application.
     closed_at: Mapped[datetime | None] = mapped_column(TimestampTz)
 
     __table_args__ = (
+        CheckConstraint(
+            "case_type IN ('ATTENDEE_ORGANIZER', 'PLATFORM')",
+            name="support_cases_case_type_valid",
+        ),
+        CheckConstraint(
+            "category IN ('TICKET_DELIVERY', 'PAYMENT', 'REFUND', 'SEATING', "
+            "'EVENT_INFORMATION', 'CHECK_IN', 'ACCOUNT', 'TECHNICAL')",
+            name="support_cases_category_valid",
+        ),
+        CheckConstraint(
+            "case_type <> 'ATTENDEE_ORGANIZER' OR event_id IS NOT NULL",
+            name="support_cases_attendee_has_event",
+        ),
         Index("idx_support_cases_status", "status", text("created_at DESC")),
+        Index("idx_support_cases_requester", "requester_user_id", text("updated_at DESC")),
+        Index(
+            "idx_support_cases_event",
+            "event_id",
+            text("updated_at DESC"),
+            postgresql_where=text("event_id IS NOT NULL"),
+        ),
+        Index(
+            "idx_support_cases_assignee",
+            "assignee_user_id",
+            text("updated_at DESC"),
+            postgresql_where=text("assignee_user_id IS NOT NULL"),
+        ),
+        Index("idx_support_cases_type", "case_type", text("updated_at DESC")),
+        Index(
+            "idx_support_cases_escalated",
+            text("escalated_at DESC"),
+            postgresql_where=text("escalated_at IS NOT NULL"),
+        ),
     )
 
 
@@ -1075,11 +1193,20 @@ class SupportMessage(Base):
     sender_user_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL")
     )
+    # Per-case, gap-free, strictly increasing number assigned under the case
+    # row lock. It is the deterministic order and the polling cursor.
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Sender's relationship to the case when the message was sent
+    # (REQUESTER | ORGANIZER | STAFF | PLATFORM_ADMIN); a historical snapshot.
+    sender_role: Mapped[str | None] = mapped_column(String(30))
     body: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
 
     __table_args__ = (
         CheckConstraint("length(trim(body)) > 0", name="support_messages_body_not_blank"),
+        CheckConstraint("sequence > 0", name="support_messages_sequence_positive"),
+        UniqueConstraint("case_id", "sequence", name="uq_support_messages_case_sequence"),
+        Index("idx_support_messages_case_created", "case_id", "created_at"),
     )
 
 
@@ -1112,6 +1239,64 @@ class Notification(Base):
             "created_at",
             postgresql_where=text("status = 'PENDING'"),
         ),
+        Index("idx_notifications_user", "user_id", text("created_at DESC")),
+    )
+
+
+class PaymentDispute(Base):
+    """A dispute recorded by a Platform Admin against a captured payment.
+
+    Bookkeeping only: opening or resolving a dispute never changes payments,
+    orders or refunds. Money moves exclusively through the refund flow.
+    """
+
+    __tablename__ = "payment_disputes"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    payment_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("payments.id", ondelete="RESTRICT"), nullable=False
+    )
+    order_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("orders.id", ondelete="RESTRICT"), nullable=False
+    )
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("events.id", ondelete="RESTRICT"), nullable=False
+    )
+    support_case_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("support_cases.id", ondelete="SET NULL")
+    )
+    opened_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    resolved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=DisputeStatus.OPEN.value
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(CHAR(3), nullable=False)
+    resolution_note: Mapped[str | None] = mapped_column(Text)
+    resolved_at: Mapped[datetime | None] = mapped_column(TimestampTz)
+    created_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('OPEN', 'UNDER_REVIEW', 'RESOLVED', 'REJECTED')",
+            name="payment_disputes_status_valid",
+        ),
+        CheckConstraint("amount > 0", name="payment_disputes_amount_positive"),
+        CheckConstraint("length(trim(reason)) > 0", name="payment_disputes_reason_not_blank"),
+        Index(
+            "uq_payment_disputes_active",
+            "payment_id",
+            unique=True,
+            postgresql_where=text("status IN ('OPEN', 'UNDER_REVIEW')"),
+            sqlite_where=text("status IN ('OPEN', 'UNDER_REVIEW')"),
+        ),
+        Index("idx_payment_disputes_status", "status", text("created_at DESC")),
     )
 
 
@@ -1143,6 +1328,11 @@ class AuditLog(Base):
             "event_id",
             text("created_at DESC"),
             postgresql_where=text("event_id IS NOT NULL"),
+        ),
+        Index(
+            "idx_audit_logs_admin",
+            text("created_at DESC"),
+            postgresql_where=text("actor_type = 'PLATFORM_ADMIN'"),
         ),
     )
 

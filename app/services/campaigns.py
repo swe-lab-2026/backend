@@ -654,7 +654,7 @@ async def resolve_token(db: AsyncSession, raw_token: str) -> tuple[Campaign, Eve
     if campaign is None:
         raise ApiError(404, "CAMPAIGN_NOT_FOUND", "Campaign not found")
     event = await repo.get_event_by_id(db, campaign.event_id)
-    if event is None or event.status != EventStatus.PUBLISHED:
+    if event is None or event.status != EventStatus.PUBLISHED or event.suspended_at is not None:
         raise ApiError(404, "CAMPAIGN_NOT_FOUND", "Campaign not found")
     ensure_usable(campaign)
     return campaign, event

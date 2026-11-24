@@ -63,7 +63,32 @@ async def activation_status(db: AsyncSession, event: Event) -> dict[str, object]
         "terms_accepted": activation.terms_accepted_at is not None,
         "is_activated": activation.activated_at is not None,
         "activated_at": activation.activated_at,
+        "sales_suspended": activation.sales_suspended_at is not None,
+        "sales_suspended_at": activation.sales_suspended_at,
+        "sales_suspension_reason": activation.sales_suspension_reason,
+        "event_suspended": event.suspended_at is not None,
+        "paid_sales_open": (
+            activation.activated_at is not None
+            and activation.sales_suspended_at is None
+            and event.suspended_at is None
+        ),
     }
+
+
+async def sales_block_reason(db: AsyncSession, event: Event) -> str | None:
+    """Why a paid sale for ``event`` must not complete right now (SCRUM-17)."""
+    if event.suspended_at is not None:
+        return "EVENT_SUSPENDED"
+    activation = await db.get(EventSalesActivation, event.id)
+    if activation is not None and activation.sales_suspended_at is not None:
+        return "PAID_SALES_SUSPENDED"
+    return None
+
+
+_BLOCK_MESSAGES = {
+    "EVENT_SUSPENDED": "This event has been suspended by the platform",
+    "PAID_SALES_SUSPENDED": "Paid ticket sales for this event have been stopped by the platform",
+}
 
 
 async def accept_terms(db: AsyncSession, event: Event, accepted: bool) -> EventSalesActivation:
@@ -86,6 +111,10 @@ async def simulate_activation_fee(db: AsyncSession, event: Event) -> EventSalesA
 
 async def activate_event(db: AsyncSession, event: Event) -> dict[str, object]:
     row = await get_or_create_activation(db, event)
+    if row.sales_suspended_at is not None:
+        # Re-running the checklist must not lift a platform stop.
+        raise ApiError(409, "PAID_SALES_SUSPENDED",
+                       "Paid ticket sales for this event have been stopped by the platform")
     status = await activation_status(db, event)
     missing = [
         name for name, key in (
@@ -124,6 +153,9 @@ async def start_simulated_payment(db: AsyncSession, user: User, order_id: UUID) 
     if event is None or activation is None or activation.activated_at is None:
         raise ApiError(409, "PAID_SALES_NOT_ACTIVATED",
                        "Paid sales are not activated for this event")
+    blocked = await sales_block_reason(db, event)
+    if blocked is not None:
+        raise ApiError(409, blocked, _BLOCK_MESSAGES[blocked])
     existing = await db.scalar(select(Payment).where(
         Payment.order_id == order.id, Payment.provider == SIMULATION_PROVIDER
     ).with_for_update())
@@ -175,28 +207,43 @@ async def resolve_simulated_payment(
     if payment.status in {PaymentStatus.FAILED, PaymentStatus.CANCELLED}:
         return payment, order
     previous = payment.status
+    blocked: str | None = None
     if outcome == "success":
         event = await db.get(Event, order.event_id)
         if event is not None and event.status == EventStatus.CANCELLED:
             raise ApiError(409, "EVENT_CANCELLED", "This event has been cancelled")
+        # Suspended mid-checkout: the attempt fails cleanly (no capture, no
+        # tickets, holds and promo capacity released) instead of completing.
+        blocked = await sales_block_reason(db, event) if event is not None else None
+    if outcome == "success" and blocked is None:
         if payment.amount != order.total_amount or payment.currency != order.currency:
             raise ApiError(409, "PAYMENT_AMOUNT_MISMATCH", "Payment amount does not match order")
         await order_service.confirm_order(db, user, order.id, qr_secret=qr_secret)
         payment.status = PaymentStatus.SUCCEEDED
         payment.paid_at = now_utc()
     else:
-        payment.status = PaymentStatus.FAILED if outcome == "failed" else PaymentStatus.CANCELLED
-        payment.failure_code = "SIMULATED_FAILURE" if outcome == "failed" else "SIMULATED_ABANDONED"
-        payment.failure_message = "Demo payment was not completed"
+        failed = outcome == "failed" or blocked is not None
+        payment.status = PaymentStatus.FAILED if failed else PaymentStatus.CANCELLED
+        if blocked is not None:
+            payment.failure_code = blocked
+            payment.failure_message = _BLOCK_MESSAGES[blocked]
+        else:
+            payment.failure_code = (
+                "SIMULATED_FAILURE" if outcome == "failed" else "SIMULATED_ABANDONED"
+            )
+            payment.failure_message = "Demo payment was not completed"
         if order.status == OrderStatus.PENDING:
             await order_service.cancel_order(db, user, order.id)
-        if outcome == "failed":
+        if failed:
             await notifications.enqueue(
                 db, order_id=order.id, kind=notifications.KIND_PAYMENT_FAILED,
                 dedupe_key=str(payment.id),
                 payload={"amount": f"{payment.amount} {payment.currency}",
                          "status": "Payment failed",
-                         "failure": "The (simulated) payment was declined."},
+                         "failure": (
+                             _BLOCK_MESSAGES[blocked] + "; you were not charged."
+                             if blocked else "The (simulated) payment was declined."
+                         )},
             )
     payment.updated_at = now_utc()
     await db.flush()

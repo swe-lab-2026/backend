@@ -16,6 +16,7 @@ from app.api.routes import (
     events,
     orders,
     organizers,
+    support,
     tickets,
     users,
 )
@@ -157,6 +158,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(orders.router, prefix=settings.api_prefix)
     app.include_router(tickets.router, prefix=settings.api_prefix)
     app.include_router(tickets.checkin_router, prefix=settings.api_prefix)
+    app.include_router(support.router, prefix=settings.api_prefix)
 
     @app.get("/")
     async def root() -> dict[str, str]:

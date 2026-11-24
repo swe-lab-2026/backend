@@ -436,6 +436,7 @@ async def list_public_catalog(
         .where(
             Event.status == EventStatus.PUBLISHED,
             Event.visibility == EventVisibility.PUBLIC,
+            Event.suspended_at.is_(None),
         )
         .order_by(Event.starts_at.asc())
         .limit(limit)

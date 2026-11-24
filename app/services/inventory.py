@@ -24,7 +24,7 @@ from app.schemas.events import (
     TicketItemResponse,
     TicketTypeInventory,
 )
-from app.services.events import as_utc
+from app.services.events import as_utc, ensure_not_suspended
 
 logger = logging.getLogger("app.inventory")
 
@@ -97,6 +97,7 @@ def _validate_saleable(event: Event, ticket_type: TicketType, now: datetime) -> 
         raise ApiError(409, "EVENT_CANCELLED", "Event is cancelled")
     if event.status != EventStatus.PUBLISHED:
         raise ApiError(409, "EVENT_NOT_ON_SALE", "Event is not on sale")
+    ensure_not_suspended(event)
     if ticket_type.is_hidden:
         raise ApiError(409, "TICKET_TYPE_HIDDEN", "Ticket type is not available")
     registration_start = as_utc(event.registration_starts_at)

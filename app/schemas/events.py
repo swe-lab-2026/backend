@@ -208,6 +208,9 @@ class EventResponse(BaseModel):
     images: list[EventImageResponse]
     created_at: datetime
     updated_at: datetime
+    # SCRUM-17: platform suspension (orthogonal to ``status``).
+    is_suspended: bool = False
+    suspended_at: datetime | None = None
 
 
 class EventSummaryResponse(BaseModel):
@@ -223,6 +226,7 @@ class EventSummaryResponse(BaseModel):
     capacity: int | None
     created_at: datetime
     updated_at: datetime
+    is_suspended: bool = False
 
 
 # ---------- Ticket types ----------
