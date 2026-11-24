@@ -1,15 +1,26 @@
 import logging
 import re
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import repositories as repo
-from app.db.models import Event, Order, OrderNotification, OrderStatus
+from app.db.models import (
+    Event,
+    Notification,
+    NotificationChannel,
+    NotificationStatus,
+    Order,
+    OrderNotification,
+    OrderStatus,
+    User,
+    UserStatus,
+)
 from app.services.email import (
     EmailDeliveryError,
     EmailProvider,
@@ -381,3 +392,114 @@ async def process_pending_notifications(
         ):
             sent += 1
     return sent
+
+
+# ---------- In-app notifications (SCRUM-16) ----------
+#
+# Support activity is not tied to an order, so it cannot use the order email
+# outbox above. It uses the pre-existing ``notifications`` table instead:
+# one IN_APP row per recipient, created in the caller's transaction (so it
+# exists if and only if the business change commits) and read via
+# ``GET /users/me/notifications``.
+
+KIND_SUPPORT_CASE_CREATED = "SUPPORT_CASE_CREATED"
+KIND_SUPPORT_MESSAGE_RECEIVED = "SUPPORT_MESSAGE_RECEIVED"
+KIND_SUPPORT_CASE_ASSIGNED = "SUPPORT_CASE_ASSIGNED"
+KIND_SUPPORT_CASE_UNASSIGNED = "SUPPORT_CASE_UNASSIGNED"
+KIND_SUPPORT_CASE_STATUS_CHANGED = "SUPPORT_CASE_STATUS_CHANGED"
+KIND_SUPPORT_CASE_RESOLVED = "SUPPORT_CASE_RESOLVED"
+KIND_SUPPORT_CASE_ESCALATED = "SUPPORT_CASE_ESCALATED"
+
+
+async def notify_users(
+    db: AsyncSession,
+    *,
+    user_ids: Iterable[UUID | None],
+    kind: str,
+    payload: dict[str, Any],
+    exclude: Iterable[UUID | None] = (),
+) -> list[UUID]:
+    """Create one in-app notification per distinct, active recipient.
+
+    ``exclude`` (typically the actor) is removed, duplicates collapse to one
+    row, and blocked/deleted accounts are skipped. Returns the recipients.
+    """
+    excluded = {user_id for user_id in exclude if user_id is not None}
+    wanted = {user_id for user_id in user_ids if user_id is not None} - excluded
+    if not wanted:
+        return []
+    active = (
+        await db.execute(
+            select(User.id).where(User.id.in_(wanted), User.status == UserStatus.ACTIVE)
+        )
+    ).scalars().all()
+    now = _now()
+    recipients = sorted(active, key=str)
+    db.add_all(
+        [
+            Notification(
+                user_id=user_id,
+                type=kind,
+                channel=NotificationChannel.IN_APP,
+                payload=payload,
+                # In-app rows are delivered by being stored.
+                status=NotificationStatus.SENT,
+                sent_at=now,
+                created_at=now,
+            )
+            for user_id in recipients
+        ]
+    )
+    return list(recipients)
+
+
+async def list_user_notifications(
+    db: AsyncSession, user_id: UUID, *, unread_only: bool, limit: int, offset: int
+) -> tuple[list[Notification], int, int]:
+    """Return (page, total, unread_count) of the user's in-app notifications."""
+    base = select(Notification).where(
+        Notification.user_id == user_id, Notification.channel == NotificationChannel.IN_APP
+    )
+    if unread_only:
+        base = base.where(Notification.read_at.is_(None))
+    total = int(
+        await db.scalar(select(func.count()).select_from(base.subquery())) or 0
+    )
+    unread = int(
+        await db.scalar(
+            select(func.count())
+            .select_from(Notification)
+            .where(
+                Notification.user_id == user_id,
+                Notification.channel == NotificationChannel.IN_APP,
+                Notification.read_at.is_(None),
+            )
+        )
+        or 0
+    )
+    rows = (
+        await db.execute(
+            base.order_by(Notification.created_at.desc(), Notification.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+    ).scalars().all()
+    return list(rows), total, unread
+
+
+async def mark_notification_read(
+    db: AsyncSession, user_id: UUID, notification_id: UUID
+) -> Notification | None:
+    """Mark one of the caller's notifications read (idempotent)."""
+    notification = await db.scalar(
+        select(Notification).where(
+            Notification.id == notification_id, Notification.user_id == user_id
+        )
+    )
+    if notification is None:
+        return None
+    if notification.read_at is None:
+        notification.read_at = _now()
+        notification.status = NotificationStatus.READ
+        await db.flush()
+    return notification

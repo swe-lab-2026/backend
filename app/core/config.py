@@ -57,6 +57,7 @@ class Settings(BaseSettings):
         "sql/migrate_006_paid_sales.sql",
         "sql/migrate_007_campaigns.sql",
         "sql/migrate_008_refunds_audit.sql",
+        "sql/migrate_009_support_admin_analytics.sql",
     ]
 
     # --- Tickets / checkout ------------------------------------------------

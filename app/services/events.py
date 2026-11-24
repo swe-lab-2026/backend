@@ -85,10 +85,23 @@ def is_authorized_viewer(event: Event, user: User | None) -> bool:
 
 
 def is_publicly_visible(event: Event) -> bool:
+    # A suspended event (SCRUM-17) is hidden from the public; its owner and
+    # Platform Admins still see it through ``is_authorized_viewer``.
     return (
         event.status in _PUBLIC_VISIBLE_STATUSES
         and event.visibility != EventVisibility.PRIVATE
+        and event.suspended_at is None
     )
+
+
+def ensure_not_suspended(event: Event) -> None:
+    """Refuse anything that would put a suspended event (back) on sale."""
+    if event.suspended_at is not None:
+        raise ApiError(
+            409,
+            "EVENT_SUSPENDED",
+            "This event has been suspended by the platform and is not available for sale",
+        )
 
 
 async def create_event(db: AsyncSession, user: User, payload: EventCreate) -> Event:
@@ -348,6 +361,7 @@ async def preview_event(
 async def publish_event(
     db: AsyncSession, actor: User, event: Event
 ) -> Event:
+    ensure_not_suspended(event)
     ticket_types = await repo.list_ticket_types(db, event.id)
     errors = collect_publish_errors(event, ticket_types)
     if errors:
@@ -432,6 +446,8 @@ async def cancel_event(
 async def duplicate_event(
     db: AsyncSession, actor: User, event: Event
 ) -> Event:
+    # A copy would be a fresh, unsuspended event: an alternate route to sales.
+    ensure_not_suspended(event)
     copy = Event(
         owner_user_id=event.owner_user_id,
         title=event.title,

@@ -1,3 +1,5 @@
+from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
@@ -10,11 +12,13 @@ from app.api.deps import (
     get_db,
     get_email_provider,
     require_active_user,
+    require_event_analytics_access,
     require_event_owner,
 )
 from app.core.config import Settings
 from app.db import repositories as repo
 from app.db.models import Event, EventImage, TicketType, User
+from app.schemas.analytics import AnalyticsResponse, TimelinePage
 from app.schemas.event_staff import (
     AssignedEventResponse,
     EventAdminAssignRequest,
@@ -48,6 +52,7 @@ from app.schemas.refunds import (
     RefundPolicyResponse,
     RefundPolicyUpdate,
 )
+from app.services import analytics as analytics_service
 from app.services import event_staff as staff_service
 from app.services import events as service
 from app.services import inventory as inventory_service
@@ -108,6 +113,8 @@ def _event_detail_response(event: Event, images: list[EventImage]) -> EventRespo
         images=[_image_response(image) for image in images],
         created_at=event.created_at,
         updated_at=event.updated_at,
+        is_suspended=event.suspended_at is not None,
+        suspended_at=event.suspended_at,
     )
 
 
@@ -125,6 +132,7 @@ def _event_summary_response(event: Event) -> EventSummaryResponse:
         capacity=event.capacity,
         created_at=event.created_at,
         updated_at=event.updated_at,
+        is_suspended=event.suspended_at is not None,
     )
 
 
@@ -601,3 +609,56 @@ async def purchase_ticket_type(
         )
         await db.commit()
     return result
+
+
+# ---------- Analytics and activity timeline (SCRUM-17) ----------
+
+
+@router.get("/{event_id}/analytics", response_model=AnalyticsResponse)
+async def get_event_analytics(
+    start: datetime | None = None,
+    end: datetime | None = None,
+    ticket_type_id: UUID | None = None,
+    event: Event = Depends(require_event_analytics_access),
+    db: AsyncSession = Depends(get_db),
+) -> AnalyticsResponse:
+    """Capacity, sales, revenue, refunds, campaign and attendance metrics.
+
+    ``start``/``end`` (UTC if no offset; ``start`` inclusive, ``end``
+    exclusive) filter historical metrics only; capacity and attendance rate
+    are current snapshots. See ``definitions`` in the response.
+    """
+    start, end = analytics_service.validate_range(start, end)
+    event_ids, ticket_type = await analytics_service.resolve_scope(
+        db,
+        event_filter=Event.id == event.id,
+        event_id=event.id,
+        ticket_type_id=ticket_type_id,
+    )
+    return await analytics_service.compute_analytics(
+        db, event_ids=event_ids, ticket_type=ticket_type, start=start, end=end
+    )
+
+
+@router.get("/{event_id}/timeline", response_model=TimelinePage)
+async def get_event_timeline(
+    action: list[str] | None = Query(default=None, max_length=20),
+    entity_type: list[str] | None = Query(default=None, max_length=20),
+    start: datetime | None = None,
+    end: datetime | None = None,
+    order: Literal["desc", "asc"] = "desc",
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    event: Event = Depends(require_event_owner),
+    db: AsyncSession = Depends(get_db),
+) -> TimelinePage:
+    """Chronological activity built from the append-only audit log.
+
+    ``action`` may repeat; a value ending in ``.`` or ``.*`` is a prefix
+    filter (e.g. ``refund.``). Entries carry actor, timestamp, action, entity
+    and a redacted human-readable description (no raw payloads).
+    """
+    return await analytics_service.event_timeline(
+        db, event, actions=action, entity_types=entity_type, start=start, end=end,
+        order=order, limit=limit, offset=offset,
+    )

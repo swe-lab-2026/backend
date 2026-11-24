@@ -31,7 +31,7 @@ from app.schemas.tickets import TicketResponse
 from app.services import campaigns as campaign_service
 from app.services import notifications
 from app.services import tickets as ticket_service
-from app.services.events import as_utc
+from app.services.events import as_utc, ensure_not_suspended
 
 logger = logging.getLogger("app.orders")
 
@@ -91,6 +91,8 @@ async def _lock_event(db: AsyncSession, event_id: UUID) -> Event:
             "EVENT_NOT_AVAILABLE",
             "Event is not available for registration",
         )
+    # Checked under the event row lock, so it serializes with suspension.
+    ensure_not_suspended(event)
     return event
 
 
@@ -247,6 +249,9 @@ async def create_order(
         if activation is None or activation.activated_at is None:
             raise ApiError(409, "PAID_SALES_NOT_ACTIVATED",
                            "Paid ticket sales are not activated for this event")
+        if activation.sales_suspended_at is not None:
+            raise ApiError(409, "PAID_SALES_SUSPENDED",
+                           "Paid ticket sales for this event have been stopped by the platform")
     currency = next(iter(currencies)) if has_priced_items else "KZT"
 
     campaign = None
@@ -641,6 +646,7 @@ async def quote_promotion(db: AsyncSession, payload: PromoValidateRequest) -> Pr
     event = await repo.get_event_by_id(db, payload.event_id)
     if event is None or event.status != EventStatus.PUBLISHED:
         raise ApiError(404, "EVENT_NOT_AVAILABLE", "Event is not available for registration")
+    ensure_not_suspended(event)
 
     quantities: dict[UUID, int] = {}
     for item in payload.items:
