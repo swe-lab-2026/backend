@@ -71,7 +71,7 @@ async def _create_and_send_code(
         code_digest=sha256_hex(code),
         expires_at=expires_at,
     )
-    await provider.send_verification_code(email=user.email, code=code)
+    await provider.send_verification_code(email=user.email, code=code, locale=user.locale)
     return _verification_expires_in(settings)
 
 
@@ -86,6 +86,7 @@ async def register(
     password: str,
     first_name: str,
     last_name: str,
+    locale: str = "en",
 ) -> tuple[User, int]:
     email = normalize_email(email)
     existing = await repo.get_user_by_email(db, email)
@@ -99,6 +100,7 @@ async def register(
         first_name=first_name.strip(),
         last_name=last_name.strip(),
     )
+    user.locale = locale
     expires_in = await _create_and_send_code(db, provider, settings, user=user)
     logger.info("registered user %s (%s)", user.id, email)
     return user, expires_in
@@ -465,7 +467,9 @@ async def request_password_reset(
         token_digest=sha256_hex(token),
         expires_at=_now() + timedelta(minutes=settings.password_reset_ttl_minutes),
     )
-    await provider.send_password_reset(email=user.email, token=token)
+    await provider.send_password_reset(
+        email=user.email, token=token, locale=user.locale
+    )
     logger.info("password reset requested for user %s", user.id)
     return _reset_expires_in(settings), settings.email_code_resend_cooldown_seconds
 

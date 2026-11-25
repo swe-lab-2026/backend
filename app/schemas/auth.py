@@ -1,5 +1,7 @@
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
+from app.schemas.users import SupportedLocale
+
 
 def _check_password_complexity(value: str) -> str:
     # Unicode-safe: checks are on characters, and max_length is on
@@ -19,6 +21,8 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=8, max_length=128)
     first_name: str = Field(min_length=1, max_length=100)
     last_name: str = Field(min_length=1, max_length=100)
+    # Language for transactional email: en (default), ru or kk.
+    locale: SupportedLocale = "en"
 
     @field_validator("password")
     @classmethod

@@ -367,12 +367,17 @@ class TicketTypeInventory(BaseModel):
     sold: int
     returned: int
     checked_in: int
+    # Remaining against this type's own capacity only (capacity - sold - reserved).
+    type_remaining: int
+    # Purchasable now: type_remaining capped by the remaining event capacity.
     available: int
 
 
 class EventInventoryResponse(BaseModel):
     event_id: UUID
     event_capacity: int | None
+    # Event capacity minus sold and active holds across all types; None when uncapped.
+    event_remaining: int | None = None
     total_sold: int
     total_reserved: int
     total_available: int

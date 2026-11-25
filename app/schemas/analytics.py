@@ -53,6 +53,10 @@ class CurrencySales(BaseModel):
     refund_count: int
     refunds: Decimal
     net_revenue: Decimal
+    # Demo payout estimate; see ``definitions["estimated_payout"]``.
+    refunded_ticket_revenue: Decimal = Decimal("0")
+    refunded_fees: Decimal | None = None
+    estimated_payout: Decimal = Decimal("0")
 
 
 class TicketTypeMetrics(BaseModel):

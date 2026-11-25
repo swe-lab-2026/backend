@@ -167,6 +167,14 @@ backend/
 available = capacity - sold - active_holds
 ```
 
+Общий лимит мероприятия (`events.capacity`) ограничивает все типы сразу. В
+`GET /api/v1/events/{event_id}/inventory` для каждого типа: `type_remaining` —
+остаток по лимиту самого типа, `available` — сколько можно продать сейчас
+(`type_remaining`, но не больше остатка мероприятия; совпадает с публичным
+`GET /ticket-types`). `event_remaining = event.capacity − sold − active_holds`
+(`null`, если лимита нет), `total_available = min(Σ type_remaining,
+event_remaining)`.
+
 Резерв билетов создаётся на ограниченное время во время checkout. После оплаты резерв превращается в проданные билеты; после истечения времени — освобождается.
 
 ### 5.6. Orders
@@ -202,6 +210,26 @@ PAID/PARTIALLY_REFUNDED -> REFUNDED
 
 Проверяет QR-код, принадлежность билета мероприятию и его статус. Двойной проход предотвращается блокировкой строки билета внутри транзакции.
 
+Каждый отказ при проходе содержит машиночитаемое поле
+`error.details.admission_status`. Коды ошибок не изменились, поэтому старые
+клиенты, которые обрабатывают `TICKET_NOT_VALID`, продолжают работать.
+`POST .../tickets/validate` возвращает то же значение в `admission_status`.
+
+| Ситуация | HTTP | `error.code` | `admission_status` |
+|---|---|---|---|
+| Пропуск выполнен | 200 | — | (ответ — билет) |
+| Подделанный/неизвестный QR | 401 | `INVALID_TICKET_QR` | `INVALID_QR` |
+| QR кампании | 400 | `CAMPAIGN_QR_NOT_ADMISSION` | `CAMPAIGN_QR` |
+| Билет не найден | 404 | `TICKET_NOT_FOUND` | `NOT_FOUND` |
+| Билет другого мероприятия | 404 | `TICKET_NOT_FOUND` | `WRONG_EVENT` |
+| Повторное сканирование | 409 | `TICKET_ALREADY_CHECKED_IN` | `ALREADY_CHECKED_IN` (+ `checked_in_at`) |
+| Билет отменён | 409 | `TICKET_NOT_VALID` | `CANCELLED` |
+| Билет возвращён | 409 | `TICKET_NOT_VALID` | `REFUNDED` |
+| Отмена прохода для не отмеченного билета | 409 | `TICKET_NOT_CHECKED_IN` | `NOT_CHECKED_IN` |
+
+Мобильному клиенту следует сначала смотреть `admission_status`, а `error.code`
+использовать как запасной вариант.
+
 ### 5.10. Campaigns
 
 Управляет промокодами, реферальными ссылками, периодом действия, лимитом использований и применимостью к типам билетов.
@@ -218,6 +246,7 @@ PAID/PARTIALLY_REFUNDED -> REFUNDED
 - Подтверждение заказа хранится в outbox `order_notifications` с уникальностью `(order_id, kind)`, поэтому повторный confirm не создаёт дубль письма и не выдаёт новые билеты.
 - Временные ошибки Brevo (429, 5xx, timeout) повторяются с exponential backoff и учётом `Retry-After`; постоянные ошибки (400/401/403, невалидный адрес) помечаются `permanent:` и больше не повторяются.
 - API-ключи, коды подтверждения, reset-токены и содержимое писем не логируются.
+- Язык писем берётся из `users.locale`: `en` (по умолчанию), `ru` или `kk`. Он задаётся при регистрации (`locale` в `POST /auth/register`) и через `PATCH /users/me`; другие значения дают `422`. Шаблоны верификации, сброса пароля, подтверждения заказа, неудачной оплаты, изменения/отмены мероприятия и возврата есть на всех трёх языках; если строки нет, используется английский. Гостевые заказы получают письма на английском. Тексты из payload (например `notice` у возврата) и названия изменённых полей пока остаются на английском.
 
 ### 5.12. Support и Audit
 
@@ -1313,6 +1342,9 @@ fixed number of queries). The response includes `definitions`.
 | `sales[].gross_revenue` | Σ `total_amount` charged = ticket_revenue + fees |
 | `sales[].refunds` | Σ `SUCCEEDED` refund amounts by `completed_at` |
 | `sales[].net_revenue` | gross_revenue − refunds |
+| `sales[].refunded_ticket_revenue` | Σ `final_price` of items in orders with a `SUCCEEDED` refund, by `completed_at` |
+| `sales[].refunded_fees` | refunds − refunded_ticket_revenue (null with a ticket type filter) |
+| `sales[].estimated_payout` | ticket_revenue − refunded_ticket_revenue (demo estimate, see below) |
 | `campaigns[]` | redemption counts (snapshot) and attributed orders/tickets/discounts/revenue by `paid_at` |
 
 Money is grouped per currency and never combined.
@@ -1327,6 +1359,16 @@ one per bar.
 **Processing fee**: `gross_ticket_sales`, `discounts`, `ticket_revenue` and
 `sales_over_time.gross` exclude the 3% fee; `fees` is the fee; `gross_revenue`,
 `refunds` and `net_revenue` include it (refunds return the full amount charged).
+
+**Estimated payout (demo only, no money moves)**: `estimated_payout =
+ticket_revenue − refunded_ticket_revenue`. The processing fee is paid by the
+buyer and kept by the platform, so it is never part of the payout. On a full
+refund the platform returns its fee (`refunded_fees`) and the organizer returns
+the ticket revenue after discounts (`refunded_ticket_revenue`). The one-time
+paid-sales activation fee is charged separately and is not deducted. Sales are
+counted by `orders.paid_at` and refunds by `refunds.completed_at` within
+`[start, end)`; with no range the estimate covers all time, so a sale and its
+refund can fall in different periods.
 
 ### Event history and timeline
 

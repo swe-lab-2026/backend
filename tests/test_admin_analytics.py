@@ -526,6 +526,8 @@ async def test_analytics_figures_match_order_payment_and_refund_records(client, 
         "gross_ticket_sales": _d("175"), "discounts": _d("5"), "ticket_revenue": _d("170"),
         "fees": _d("5.10"), "gross_revenue": _d("175.10"), "refund_count": 1,
         "refunds": _d("25.75"), "net_revenue": _d("149.35"),
+        "refunded_ticket_revenue": _d("25"), "refunded_fees": _d("0.75"),
+        "estimated_payout": _d("145"),
     }
     # gross_revenue equals what customers were charged (no double discount).
     charged = sum(
@@ -564,6 +566,8 @@ async def test_analytics_figures_match_order_payment_and_refund_records(client, 
     assert ga_sales["fees"] is None
     assert ga_sales["gross_revenue"] == _d("70") and ga_sales["refunds"] == _d("25")
     assert ga_sales["net_revenue"] == _d("45")
+    assert ga_sales["refunded_fees"] is None
+    assert ga_sales["estimated_payout"] == _d("45")
     assert [t["name"] for t in ga_only["ticket_types"]] == ["General Admission"]
     assert ga_only["capacity"]["total_capacity"] == 10
     assert ga_only["campaigns"][0]["sales"][0]["revenue"] == _d("45")
@@ -598,6 +602,50 @@ async def test_analytics_figures_match_order_payment_and_refund_records(client, 
         client, owner_token,
         f"/events/{event['id']}/campaigns/{campaign['campaign_id']}/analytics")).json()
     assert campaign_stats["tickets_sold"] == 2
+
+
+async def test_estimated_payout_for_discounted_then_refunded_order(client, app, db):
+    _owner, owner_token, event, ga, vip = await _setup(client, app, db, prefix="payout")
+    await _campaign(client, owner_token, event["id"], ticket_type_ids=[ga["id"]])
+    await _enable_refunds(client, owner_token, event["id"])
+    path = f"/events/{event['id']}/analytics"
+
+    # 2 x GA at 25.00 with 10% promo: 50 - 5 = 45 ticket revenue, 1.35 fee.
+    _a, a_token = await _buyer(app, db, "payout-a@example.com")
+    a = (await _order(client, a_token, event["id"], [_item(ga, 2)], promo_code="spring10")).json()
+    await _pay(client, a_token, a["id"])
+    # 1 x VIP at 100.00, kept: 3.00 fee.
+    _b, b_token = await _buyer(app, db, "payout-b@example.com")
+    b = (await _order(client, b_token, event["id"], [_item(vip)])).json()
+    await _pay(client, b_token, b["id"])
+
+    [before] = (await _get(client, owner_token, path)).json()["sales"]
+    assert (before["gross_ticket_sales"], before["discounts"], before["fees"]) == (
+        _d("150"), _d("5"), _d("4.35"))
+    assert before["refunds"] == _d("0") and before["estimated_payout"] == _d("145")
+
+    assert (await _post(client, a_token, f"/orders/{a['id']}/refund")).status_code == 200
+    data = (await _get(client, owner_token, path)).json()
+    [after] = data["sales"]
+    assert after["gross_ticket_sales"] == _d("150")  # sale stays in its paid_at period
+    assert after["discounts"] == _d("5")
+    assert after["fees"] == _d("4.35")
+    assert after["refunds"] == _d("46.35")
+    assert after["refunded_ticket_revenue"] == _d("45")
+    assert after["refunded_fees"] == _d("1.35")
+    assert after["estimated_payout"] == _d("100")
+    assert "estimated_payout" in data["definitions"]
+    # Every KZT component is distinct and the estimate reconciles with them.
+    assert Decimal(after["estimated_payout"]) == (
+        Decimal(after["gross_ticket_sales"]) - Decimal(after["discounts"])
+        - Decimal(after["refunded_ticket_revenue"]))
+
+    # Time range: a window that ends before any sale reports nothing.
+    past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    assert (await _get(client, owner_token, path, end=past)).json()["sales"] == []
+    # The organizer-wide summary matches the single event.
+    agg = (await _get(client, owner_token, "/organizers/me/analytics")).json()
+    assert agg["sales"] == data["sales"]
 
 
 async def test_attendance_ignores_repeated_and_reversed_check_ins(client, app, db):

@@ -83,12 +83,21 @@ async def availability_by_type(
 
 
 async def get_event_inventory(db: AsyncSession, event: Event) -> EventInventoryResponse:
+    """Organizer inventory view.
+
+    Per-type ``available`` uses the same rule as public availability
+    (:func:`availability_by_type`): type capacity minus sold and active holds,
+    capped by what is left of the shared event capacity. ``total_available``
+    is the number of tickets that can still be sold across all types, so it
+    never exceeds the remaining event capacity.
+    """
     now = _now()
     ticket_types = await repo.list_ticket_types(db, event.id)
+    available_by_type = await availability_by_type(db, event, ticket_types)
     items: list[TicketTypeInventory] = []
     total_sold = 0
     total_reserved = 0
-    total_available = 0
+    type_level_available = 0
 
     for ticket_type in ticket_types:
         sold = await repo.count_sold_items(db, ticket_type.id)
@@ -99,10 +108,10 @@ async def get_event_inventory(db: AsyncSession, event: Event) -> EventInventoryR
         checked_in = await repo.count_tickets_by_status(
             db, ticket_type.id, status=TicketStatus.CHECKED_IN
         )
-        available = max(ticket_type.capacity - sold - reserved, 0)
+        type_remaining = max(ticket_type.capacity - sold - reserved, 0)
         total_sold += sold
         total_reserved += reserved
-        total_available += available
+        type_level_available += type_remaining
         items.append(
             TicketTypeInventory(
                 ticket_type_id=ticket_type.id,
@@ -113,13 +122,21 @@ async def get_event_inventory(db: AsyncSession, event: Event) -> EventInventoryR
                 sold=sold,
                 returned=returned,
                 checked_in=checked_in,
-                available=available,
+                type_remaining=type_remaining,
+                available=available_by_type[ticket_type.id],
             )
         )
+
+    event_remaining: int | None = None
+    total_available = type_level_available
+    if event.capacity is not None:
+        event_remaining = max(event.capacity - total_sold - total_reserved, 0)
+        total_available = min(type_level_available, event_remaining)
 
     return EventInventoryResponse(
         event_id=event.id,
         event_capacity=event.capacity,
+        event_remaining=event_remaining,
         total_sold=total_sold,
         total_reserved=total_reserved,
         total_available=total_available,

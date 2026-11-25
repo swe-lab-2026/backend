@@ -63,6 +63,56 @@ def hash_qr_payload(payload: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+class AdmissionStatus:
+    """Machine-readable admission outcomes (``error.details.admission_status``).
+
+    Every admission rejection carries one of these values, so scanners can map
+    results without parsing messages. Error ``code`` values are unchanged for
+    compatibility: cancelled and refunded tickets still use ``TICKET_NOT_VALID``.
+    """
+
+    ADMITTED = "ADMITTED"
+    VALID = "VALID"
+    INVALID_QR = "INVALID_QR"
+    CAMPAIGN_QR = "CAMPAIGN_QR"
+    NOT_FOUND = "NOT_FOUND"
+    WRONG_EVENT = "WRONG_EVENT"
+    ALREADY_CHECKED_IN = "ALREADY_CHECKED_IN"
+    CANCELLED = "CANCELLED"
+    REFUNDED = "REFUNDED"
+    NOT_CHECKED_IN = "NOT_CHECKED_IN"
+
+
+_STATUS_TO_ADMISSION = {
+    TicketStatus.VALID: AdmissionStatus.VALID,
+    TicketStatus.CHECKED_IN: AdmissionStatus.ALREADY_CHECKED_IN,
+    TicketStatus.CANCELLED: AdmissionStatus.CANCELLED,
+    TicketStatus.REFUNDED: AdmissionStatus.REFUNDED,
+}
+
+
+def admission_status_for(status: TicketStatus) -> str:
+    return _STATUS_TO_ADMISSION[status]
+
+
+def _invalid_qr() -> ApiError:
+    return ApiError(
+        401,
+        "INVALID_TICKET_QR",
+        "Invalid ticket QR code",
+        details={"admission_status": AdmissionStatus.INVALID_QR},
+    )
+
+
+def _ticket_not_found(admission_status: str = AdmissionStatus.NOT_FOUND) -> ApiError:
+    return ApiError(
+        404,
+        "TICKET_NOT_FOUND",
+        "Ticket not found",
+        details={"admission_status": admission_status},
+    )
+
+
 _CAMPAIGN_LINK_RE = re.compile(
     r"/campaigns/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/?$"
 )
@@ -80,16 +130,16 @@ def _campaign_token_candidate(payload: str) -> UUID | None:
 def _verify_qr_payload(payload: str, secret: str) -> UUID:
     parts = payload.strip().split(".")
     if len(parts) != 3 or parts[0] != _QR_VERSION:
-        raise ApiError(401, "INVALID_TICKET_QR", "Invalid ticket QR code")
+        raise _invalid_qr()
     try:
         public_id = UUID(parts[1])
     except ValueError as exc:
-        raise ApiError(401, "INVALID_TICKET_QR", "Invalid ticket QR code") from exc
+        raise _invalid_qr() from exc
 
     subject = f"{_QR_VERSION}.{public_id}"
     expected = _sign(subject, secret)
     if not hmac.compare_digest(expected, parts[2]):
-        raise ApiError(401, "INVALID_TICKET_QR", "Invalid ticket QR code")
+        raise _invalid_qr()
     return public_id
 
 
@@ -111,10 +161,10 @@ async def _resolve_ticket(
     if public_id is not None:
         ticket = await repo.get_ticket_by_public_id(db, public_id)
         if ticket is None:
-            raise ApiError(404, "TICKET_NOT_FOUND", "Ticket not found")
+            raise _ticket_not_found()
         if hmac.compare_digest(ticket.qr_token_hash, hash_qr_payload(payload)):
             return ticket
-        raise ApiError(401, "INVALID_TICKET_QR", "Invalid ticket QR code")
+        raise _invalid_qr()
 
     # Campaign QR codes are promotional links, never admission credentials.
     # They encode either a bare token or ``https://<web>/campaigns/<token>``;
@@ -128,14 +178,15 @@ async def _resolve_ticket(
                 400,
                 "CAMPAIGN_QR_NOT_ADMISSION",
                 "Campaign QR codes cannot be used for admission",
+                details={"admission_status": AdmissionStatus.CAMPAIGN_QR},
             )
     if _CAMPAIGN_LINK_RE.search(payload) or payload.lower().startswith(("http://", "https://")):
         # A link is never an admission credential; skip the hash lookup.
-        raise ApiError(401, "INVALID_TICKET_QR", "Invalid ticket QR code")
+        raise _invalid_qr()
 
     ticket = await repo.get_ticket_by_qr_hash(db, hash_qr_payload(payload))
     if ticket is None:
-        raise ApiError(401, "INVALID_TICKET_QR", "Invalid ticket QR code")
+        raise _invalid_qr()
     return ticket
 
 
@@ -301,8 +352,11 @@ async def _ensure_ticket_belongs_to_event(
     db: AsyncSession, ticket: Ticket, event: Event
 ) -> None:
     context = await repo.get_ticket_order_item(db, ticket)
-    if context is None or context[2].id != event.id:
-        raise ApiError(404, "TICKET_NOT_FOUND", "Ticket not found")
+    if context is None:
+        raise _ticket_not_found()
+    if context[2].id != event.id:
+        # Same 404 code as before; staff still learn the ticket is for another event.
+        raise _ticket_not_found(AdmissionStatus.WRONG_EVENT)
 
 
 async def validate_ticket_qr(
@@ -312,16 +366,18 @@ async def validate_ticket_qr(
     qr_payload: str,
     qr_secret: str,
     download_base: str,
-) -> tuple[TicketResponse, str | None]:
+) -> tuple[TicketResponse, str | None, str]:
+    """Return the ticket, the legacy ``reason`` and the admission status."""
     ticket = await _resolve_ticket(db, qr_payload, qr_secret)
     await _ensure_ticket_belongs_to_event(db, ticket, event)
 
     response = await build_ticket_response(
         db, ticket, qr_secret=qr_secret, download_base=download_base
     )
+    admission_status = admission_status_for(ticket.status)
     if ticket.status != TicketStatus.VALID:
-        return response, f"TICKET_{ticket.status.value}"
-    return response, None
+        return response, f"TICKET_{ticket.status.value}", admission_status
+    return response, None, admission_status
 
 
 async def _perform_check_in(
@@ -355,12 +411,22 @@ async def _perform_check_in(
                 409,
                 "TICKET_ALREADY_CHECKED_IN",
                 "Ticket has already been checked in",
-                details={"checked_in_at": checked_in_at},
+                details={
+                    "checked_in_at": checked_in_at,
+                    "admission_status": AdmissionStatus.ALREADY_CHECKED_IN,
+                    "ticket_status": ticket.status.value,
+                },
             )
+        # Cancelled and refunded keep the legacy TICKET_NOT_VALID code;
+        # ``admission_status`` tells them apart.
         raise ApiError(
             409,
             "TICKET_NOT_VALID",
             f"Ticket cannot be admitted in status {ticket.status.value}",
+            details={
+                "admission_status": admission_status_for(ticket.status),
+                "ticket_status": ticket.status.value,
+            },
         )
 
     db.add(
@@ -426,7 +492,7 @@ async def manual_check_in_ticket(
     """
     ticket = await repo.get_ticket_by_public_id(db, public_id)
     if ticket is None:
-        raise ApiError(404, "TICKET_NOT_FOUND", "Ticket not found")
+        raise _ticket_not_found()
     await _ensure_ticket_belongs_to_event(db, ticket, event)
     return await _perform_check_in(
         db,
@@ -455,7 +521,7 @@ async def reverse_check_in_ticket(
     """
     ticket = await repo.get_ticket_by_public_id(db, public_id)
     if ticket is None:
-        raise ApiError(404, "TICKET_NOT_FOUND", "Ticket not found")
+        raise _ticket_not_found()
     await _ensure_ticket_belongs_to_event(db, ticket, event)
 
     previous_checked_in_at = ticket.checked_in_at
@@ -476,7 +542,11 @@ async def reverse_check_in_ticket(
                 409,
                 "TICKET_NOT_CHECKED_IN",
                 "Ticket is not currently checked in",
-                details={"status": ticket.status.value},
+                details={
+                    "status": ticket.status.value,
+                    "admission_status": AdmissionStatus.NOT_CHECKED_IN,
+                    "ticket_status": ticket.status.value,
+                },
             )
         raise ApiError(
             409,

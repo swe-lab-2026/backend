@@ -25,6 +25,7 @@ def _to_response(user: User) -> UserResponse:
         status=user.status.value,
         email_verified_at=user.email_verified_at,
         created_at=user.created_at,
+        locale=user.locale,
     )
 
 
@@ -43,6 +44,8 @@ async def update_me(
         user.first_name = body.first_name.strip()
     if body.last_name is not None:
         user.last_name = body.last_name.strip()
+    if body.locale is not None:
+        user.locale = body.locale
     return _to_response(user)
 
 

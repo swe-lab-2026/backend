@@ -69,6 +69,7 @@ async def register(
         password=body.password,
         first_name=body.first_name,
         last_name=body.last_name,
+        locale=body.locale,
     )
     return RegisterResponse(
         email=user.email,

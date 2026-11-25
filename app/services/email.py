@@ -119,19 +119,26 @@ class DevEmailProvider:
 
     def __init__(self) -> None:
         self._last_codes: dict[str, str] = {}
+        self._last_locales: dict[str, str] = {}
         self._last_reset_tokens: dict[str, str] = {}
         self._order_confirmations: list[OrderConfirmationEmail] = []
         self._notifications: list[NotificationEmail] = []
 
     async def send_verification_code(self, *, email: str, code: str, locale: str = "en") -> None:
         self._last_codes[email] = code
+        self._last_locales[email] = locale
         logger.info("verification code for %s: %s", email, code)
 
     def last_code_for(self, email: str) -> str | None:
         return self._last_codes.get(email)
 
+    def last_locale_for(self, email: str) -> str | None:
+        """Locale of the last verification code or reset email for an address."""
+        return self._last_locales.get(email)
+
     async def send_password_reset(self, *, email: str, token: str, locale: str = "en") -> None:
         self._last_reset_tokens[email] = token
+        self._last_locales[email] = locale
         # The raw token is deliberately never logged: unlike a short-lived
         # verification code it is a bearer credential, and production logs
         # must not contain it either.
