@@ -43,6 +43,14 @@ _COPY: dict[str, dict[str, str]] = {
         "reset.subject": "Reset your BiletFlow password",
         "reset.intro": "A password reset was requested for your BiletFlow account.",
         "reset.token": "Reset token:",
+        "reset.button": "Reset password",
+        "reset.link_intro": "Open the link below to choose a new password.",
+        "reset.expires": "The link can be used once and expires in {minutes} minutes.",
+        "reset.fallback": "If the button does not work, copy this link into your browser:",
+        "reset.ignore": (
+            "If you did not request a reset, you can ignore this message; "
+            "your current password remains valid."
+        ),
         "reset.outro": (
             "Use this token in the app to choose a new password. "
             "If you did not request a reset, you can ignore this message; "
@@ -108,6 +116,14 @@ _COPY: dict[str, dict[str, str]] = {
         "reset.subject": "Сброс пароля BiletFlow",
         "reset.intro": "Для вашего аккаунта BiletFlow запрошен сброс пароля.",
         "reset.token": "Токен для сброса:",
+        "reset.button": "Сбросить пароль",
+        "reset.link_intro": "Перейдите по ссылке ниже, чтобы задать новый пароль.",
+        "reset.expires": "Ссылка одноразовая и действует {minutes} мин.",
+        "reset.fallback": "Если кнопка не работает, скопируйте эту ссылку в браузер:",
+        "reset.ignore": (
+            "Если вы не запрашивали сброс, проигнорируйте это письмо: "
+            "текущий пароль останется действительным."
+        ),
         "reset.outro": (
             "Используйте этот токен в приложении, чтобы задать новый пароль. "
             "Если вы не запрашивали сброс, проигнорируйте это письмо: "
@@ -173,6 +189,14 @@ _COPY: dict[str, dict[str, str]] = {
         "reset.subject": "BiletFlow құпиясөзін қалпына келтіру",
         "reset.intro": "BiletFlow аккаунтыңыз үшін құпиясөзді қалпына келтіру сұралды.",
         "reset.token": "Қалпына келтіру токені:",
+        "reset.button": "Құпиясөзді қалпына келтіру",
+        "reset.link_intro": "Жаңа құпиясөз орнату үшін төмендегі сілтемені ашыңыз.",
+        "reset.expires": "Сілтеме бір рет қолданылады және {minutes} минут жарамды.",
+        "reset.fallback": "Батырма жұмыс істемесе, бұл сілтемені браузерге көшіріңіз:",
+        "reset.ignore": (
+            "Егер сіз қалпына келтіруді сұрамаған болсаңыз, бұл хатты елемеңіз: "
+            "қазіргі құпиясөзіңіз жарамды болып қала береді."
+        ),
         "reset.outro": (
             "Жаңа құпиясөз орнату үшін осы токенді қолданбада пайдаланыңыз. "
             "Егер сіз қалпына келтіруді сұрамаған болсаңыз, бұл хатты елемеңіз: "
@@ -302,9 +326,43 @@ def render_verification_email(*, code: str, locale: str = DEFAULT_LOCALE) -> Ema
     )
 
 
-def render_password_reset_email(*, token: str, locale: str = DEFAULT_LOCALE) -> EmailContent:
+def render_password_reset_email(
+    *,
+    token: str,
+    locale: str = DEFAULT_LOCALE,
+    link: str | None = None,
+    expires_in_minutes: int | None = None,
+) -> EmailContent:
+    """Reset email. With ``link`` (web page or app deep link that already
+    carries the token) the email shows a button and never the bare token;
+    without one it falls back to the copyable token."""
     loc = normalize_locale(locale)
     subject = _t(loc, "reset.subject")
+    if link:
+        intro, lead = _t(loc, "reset.intro"), _t(loc, "reset.link_intro")
+        button, fallback, ignore = (
+            _t(loc, "reset.button"), _t(loc, "reset.fallback"), _t(loc, "reset.ignore")
+        )
+        expires = (
+            _t(loc, "reset.expires", minutes=expires_in_minutes)
+            if expires_in_minutes else ""
+        )
+        text = f"{intro}\n\n{lead}\n\n{link}\n\n" + (f"{expires}\n\n" if expires else "")
+        text += ignore
+        href = escape(link, quote=True)
+        body = (
+            f"<p>{escape(intro)}</p><p>{escape(lead)}</p>"
+            f"<p><a href=\"{href}\" style=\"display:inline-block;padding:10px 18px;"
+            "background:#2b59c3;color:#fff;text-decoration:none;border-radius:6px\">"
+            f"{escape(button)}</a></p>"
+            + (f"<p>{escape(expires)}</p>" if expires else "")
+            + f"<p style=\"font-size:12px;color:#555\">{escape(fallback)}<br>"
+            f"<a href=\"{href}\" style=\"word-break:break-all\">{escape(link)}</a></p>"
+            f"<p>{escape(ignore)}</p>"
+        )
+        return EmailContent(
+            subject=_safe_subject(subject), text=text, html=_page(subject, body, loc)
+        )
     intro, label, outro = _t(loc, "reset.intro"), _t(loc, "reset.token"), _t(loc, "reset.outro")
     text = f"{intro}\n\n{label}\n\n{token}\n\n{outro}"
     body = (

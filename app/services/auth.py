@@ -3,6 +3,7 @@ import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -425,6 +426,19 @@ _RESET_COOLDOWN_KEY = "pwdreset:{email}"
 _RESET_HOURLY_KEY = "pwdreset:{email}:hour"
 
 
+def password_reset_link(settings: Settings, *, email: str, token: str) -> str | None:
+    """``{PASSWORD_RESET_URL}?token=...&email=...`` for the reset email.
+
+    The web page or app reads both query parameters and posts them with the
+    new password to ``POST /auth/reset-password``. None when no web origin or
+    reset URL is configured (the email then shows the raw token).
+    """
+    base = settings.password_reset_link_base
+    if not base:
+        return None
+    return f"{base}?{urlencode({'token': token, 'email': email})}"
+
+
 def _reset_expires_in(settings: Settings) -> int:
     return settings.password_reset_ttl_minutes * 60
 
@@ -468,7 +482,11 @@ async def request_password_reset(
         expires_at=_now() + timedelta(minutes=settings.password_reset_ttl_minutes),
     )
     await provider.send_password_reset(
-        email=user.email, token=token, locale=user.locale
+        email=user.email,
+        token=token,
+        locale=user.locale,
+        link=password_reset_link(settings, email=user.email, token=token),
+        expires_in_minutes=settings.password_reset_ttl_minutes,
     )
     logger.info("password reset requested for user %s", user.id)
     return _reset_expires_in(settings), settings.email_code_resend_cooldown_seconds

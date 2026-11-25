@@ -218,3 +218,74 @@ async def test_password_reset_request_cooldown(client):
     second = await _request_reset(client)
     assert second.status_code == 429
     assert second.json()["error"]["code"] == "TOO_MANY_ATTEMPTS"
+
+
+# ---------- Reset link / deep link in the email ----------
+
+async def test_reset_email_links_to_frontend_with_token_and_email(client, app):
+    from urllib.parse import parse_qs, urlsplit
+
+    app.state.settings.public_web_base_url = "https://web.example.com"
+    await _register(client, email="link-user+1@example.com")
+    assert (await _request_reset(client, email="link-user+1@example.com")).status_code == 200
+    provider = app.state.email_provider
+    link = provider.last_reset_link_for("link-user+1@example.com")
+    assert link is not None
+    parts = urlsplit(link)
+    assert (parts.scheme, parts.netloc, parts.path) == ("https", "web.example.com",
+                                                        "/reset-password")
+    query = parse_qs(parts.query)
+    assert query["email"] == ["link-user+1@example.com"]  # "+" survives encoding
+    assert query["token"] == [await _reset_token(app, "link-user+1@example.com")]
+
+    # The frontend posts exactly what the link carried.
+    confirmed = await _confirm_reset(client, email=query["email"][0], token=query["token"][0])
+    assert confirmed.status_code == 200, confirmed.text
+
+
+async def test_reset_link_can_be_an_app_deep_link(client, app):
+    app.state.settings.password_reset_url = "biletflow://reset-password"
+    await _register(client, email="deeplink@example.com")
+    await _request_reset(client, email="deeplink@example.com")
+    link = app.state.email_provider.last_reset_link_for("deeplink@example.com")
+    assert link is not None and link.startswith("biletflow://reset-password?token=")
+
+
+async def test_reset_email_without_configured_origin_keeps_token(client, app):
+    await _register(client, email="nolink@example.com")
+    await _request_reset(client, email="nolink@example.com")
+    assert app.state.email_provider.last_reset_link_for("nolink@example.com") is None
+
+
+def test_reset_email_template_shows_button_not_bare_token():
+    from app.services.email_templates import _COPY, render_password_reset_email
+
+    link = "https://web.example.com/reset-password?token=abc&email=a%40b.kz"
+    content = render_password_reset_email(token="abc", locale="ru", link=link,
+                                          expires_in_minutes=30)
+    assert _COPY["ru"]["reset.button"] in content.html
+    assert 'href="https://web.example.com/reset-password?token=abc&amp;email=a%40b.kz"' \
+        in content.html
+    assert link in content.text and "30" in content.text
+    assert _COPY["ru"]["reset.token"] not in content.text
+    fallback = render_password_reset_email(token="abc", locale="ru")
+    assert _COPY["ru"]["reset.token"] in fallback.text and "abc" in fallback.text
+
+
+def test_password_reset_url_validation():
+    import pytest
+    from pydantic import ValidationError
+
+    from tests.conftest import test_settings
+
+    base = test_settings().model_dump()
+    ok = {**base, "password_reset_url": "biletflow://reset-password"}
+    from app.core.config import Settings
+
+    assert Settings(**ok).password_reset_link_base == "biletflow://reset-password"
+    web = {**base, "public_web_base_url": "https://web.example.com/"}
+    assert Settings(**web).password_reset_link_base == "https://web.example.com/reset-password"
+    for bad in ("javascript://alert(1)", "reset-password", "https://x.kz/r?a=1",
+                "https://x.kz/r#t"):
+        with pytest.raises(ValidationError):
+            Settings(**{**base, "password_reset_url": bad})
