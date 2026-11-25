@@ -63,6 +63,15 @@ class SupportStatusUpdate(BaseModel):
     note: str | None = Field(default=None, max_length=1000)
 
 
+class SupportCaseUpdate(BaseModel):
+    """``PATCH /support/cases/{id}``. Omitted fields are left unchanged;
+    ``"assignee_user_id": null`` unassigns."""
+
+    status: SupportCaseStatusValue | None = None
+    assignee_user_id: UUID | None = None
+    note: str | None = Field(default=None, max_length=1000)
+
+
 class SupportAssignmentUpdate(BaseModel):
     # null unassigns the case.
     assignee_user_id: UUID | None
@@ -80,6 +89,23 @@ class SupportEscalationRequest(BaseModel):
 class SupportParticipant(BaseModel):
     user_id: UUID
     display_name: str
+    name: str  # same value as display_name (added after PR 19)
+
+
+class SupportEventRef(BaseModel):
+    id: UUID
+    title: str
+
+
+class SupportOrderRef(BaseModel):
+    id: UUID
+    order_number: int
+
+
+class SupportTicketRef(BaseModel):
+    id: UUID
+    public_id: UUID
+    ticket_type_name: str
 
 
 class SupportCaseAccessResponse(BaseModel):
@@ -98,11 +124,16 @@ class SupportCaseResponse(BaseModel):
     status: str
     requester: SupportParticipant | None
     assignee: SupportParticipant | None
+    event: SupportEventRef | None
+    order: SupportOrderRef | None
+    ticket: SupportTicketRef | None
+    # Flat copies of the references (kept for compatibility).
     event_id: UUID | None
     event_title: str | None
     order_id: UUID | None
     order_number: int | None
     ticket_id: UUID | None
+    ticket_public_id: UUID | None = None
     is_escalated: bool
     escalated_at: datetime | None
     escalation_reason: str | None
@@ -123,6 +154,7 @@ class SupportCasePage(BaseModel):
 class SupportMessageSender(BaseModel):
     user_id: UUID | None
     display_name: str | None
+    name: str | None  # same value as display_name (added after PR 19)
     role: str | None  # REQUESTER | ORGANIZER | STAFF | PLATFORM_ADMIN
 
 
@@ -172,6 +204,7 @@ class SupportActivityPage(BaseModel):
 class SupportAssignableUser(BaseModel):
     user_id: UUID
     display_name: str
+    name: str  # same value as display_name (added after PR 19)
     role: str  # ORGANIZER | STAFF | PLATFORM_ADMIN
 
 

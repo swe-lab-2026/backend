@@ -4,28 +4,37 @@ The role is checked per request against the live user row (an access token
 issued before a demotion or suspension stops working immediately).
 """
 
+import csv
+import io
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db, require_roles
+from app.api.routes.organizers import _payout_response, _profile_response
+from app.core.errors import ApiError
+from app.db import repositories as repo
 from app.db.models import (
     EventStatus,
     OrderStatus,
     PaymentStatus,
+    PayoutAccount,
+    PayoutStatus,
     RefundStatus,
     SupportCaseStatus,
     SupportCaseType,
     User,
     UserRole,
     UserStatus,
+    VerificationStatus,
 )
 from app.schemas.admin import (
     AdminActionResponse,
     AdminActivationResponse,
+    AdminCampaignResponse,
     AdminEventActionResponse,
     AdminEventResponse,
     AdminOrderResponse,
@@ -39,10 +48,14 @@ from app.schemas.admin import (
     DisputeUpdate,
     FailureKind,
     OperationalFailureResponse,
+    OrganizerVerificationUpdate,
     Page,
+    PayoutStatusUpdate,
 )
+from app.schemas.organizers import OrganizerProfileResponse, PayoutAccountResponse
 from app.schemas.support import SupportCasePage, SupportCaseStatusValue
 from app.services import admin as service
+from app.services import organizers as organizer_service
 from app.services import support as support_service
 
 require_admin = require_roles("PLATFORM_ADMIN")
@@ -237,18 +250,20 @@ async def search_payments(
 @router.get("/activations", response_model=Page[AdminActivationResponse])
 async def list_activations(
     status: Literal["NOT_ACTIVATED", "ACTIVE", "SUSPENDED"] | None = None,
+    q: str | None = Query(default=None, min_length=1, max_length=200),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
 ) -> Page[AdminActivationResponse]:
     """Per-event paid-sales activation records."""
-    return await service.list_activations(db, status=status, limit=limit, offset=offset)
+    return await service.list_activations(db, status=status, q=q, limit=limit, offset=offset)
 
 
 @router.get("/refunds", response_model=Page[AdminRefundResponse])
 async def list_refunds(
     status: RefundStatus | None = None,
-    kind: Literal["CUSTOMER_REQUEST", "EVENT_CANCELLATION"] | None = None,
+    kind: Literal["CUSTOMER_REQUEST", "EVENT_CANCELLATION", "ORGANIZER_REQUEST"] | None = None,
+    q: str | None = Query(default=None, min_length=1, max_length=200),
     event_id: UUID | None = None,
     created_from: datetime | None = None,
     created_to: datetime | None = None,
@@ -257,7 +272,7 @@ async def list_refunds(
     db: AsyncSession = Depends(get_db),
 ) -> Page[AdminRefundResponse]:
     return await service.list_refunds(
-        db, status=status, kind=kind, event_id=event_id,
+        db, status=status, kind=kind, event_id=event_id, q=q,
         created_from=created_from, created_to=created_to, limit=limit, offset=offset,
     )
 
@@ -314,6 +329,46 @@ async def list_admin_actions(
     )
 
 
+@router.get("/campaigns", response_model=Page[AdminCampaignResponse])
+async def list_campaigns(
+    q: str | None = Query(default=None, min_length=1, max_length=200),
+    event_id: UUID | None = None,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+) -> Page[AdminCampaignResponse]:
+    """All promo campaigns; ``q`` matches name, code or event title."""
+    return await service.list_campaigns(db, q=q, event_id=event_id, limit=limit, offset=offset)
+
+
+@router.get(
+    "/export/{kind}.csv",
+    response_class=Response,
+    responses={200: {"content": {"text/csv": {}}}},
+)
+async def export_csv(
+    kind: Literal["users", "events", "orders", "payments"],
+    q: str | None = Query(default=None, min_length=1, max_length=200),
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """CSV export (newest first, at most 10,000 rows) with the same ``q`` search
+    and redaction as the JSON lists. Formula-like cells are prefixed with '."""
+    rows = await service.export_rows(db, kind, q=q)
+    buffer = io.StringIO()
+    csv.writer(buffer).writerows(rows)
+    await repo.add_audit_entry(
+        db, actor_user_id=admin.id, actor_type="PLATFORM_ADMIN", entity_type="export",
+        entity_id=None, action="admin.data_exported",
+        metadata={"kind": kind, "q": q, "rows": len(rows) - 1},
+    )
+    return Response(
+        content=buffer.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{kind}.csv"'},
+    )
+
+
 # ---------- Disputes ----------
 
 
@@ -354,3 +409,42 @@ async def update_dispute(
     return await service.update_dispute(
         db, admin, dispute_id, status=payload.status.value, note=payload.resolution_note
     )
+
+
+# ---------- Organizer verification and payout approval ----------
+
+
+@router.post("/organizers/{user_id}/verification", response_model=OrganizerProfileResponse)
+async def set_organizer_verification(
+    user_id: UUID,
+    payload: OrganizerVerificationUpdate,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> OrganizerProfileResponse:
+    profile = await repo.get_organizer_profile(db, user_id)
+    if profile is None:
+        raise ApiError(404, "ORGANIZER_PROFILE_NOT_FOUND", "Organizer profile not found")
+    await organizer_service.set_verification_status(
+        db, admin, profile, VerificationStatus(payload.status),
+        action="admin.organizer_verification_set", actor_type="PLATFORM_ADMIN",
+        reason=payload.reason,
+    )
+    return _profile_response(profile)
+
+
+@router.post("/payout-accounts/{account_id}/status", response_model=PayoutAccountResponse)
+async def set_payout_account_status(
+    account_id: UUID,
+    payload: PayoutStatusUpdate,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> PayoutAccountResponse:
+    account = await db.get(PayoutAccount, account_id)
+    if account is None:
+        raise ApiError(404, "PAYOUT_ACCOUNT_NOT_FOUND", "Payout account not found")
+    await organizer_service.set_payout_status(
+        db, admin, account, PayoutStatus(payload.status),
+        action="admin.payout_account_status_set", actor_type="PLATFORM_ADMIN",
+        reason=payload.reason,
+    )
+    return _payout_response(account)

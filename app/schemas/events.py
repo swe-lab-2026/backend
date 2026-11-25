@@ -208,6 +208,8 @@ class EventResponse(BaseModel):
     images: list[EventImageResponse]
     created_at: datetime
     updated_at: datetime
+    # Paid checkout is open: activated, not stopped, event not suspended.
+    paid_sales_active: bool = False
     # SCRUM-17: platform suspension (orthogonal to ``status``).
     is_suspended: bool = False
     suspended_at: datetime | None = None
@@ -348,6 +350,9 @@ class TicketTypeResponse(BaseModel):
     is_hidden: bool
     created_at: datetime
     updated_at: datetime
+    # Tickets that can still be bought: capacity - sold - active holds, capped
+    # by what is left of the event capacity. Set on GET /events/{id}/ticket-types.
+    available: int | None = None
 
 
 # ---------- Inventory ----------

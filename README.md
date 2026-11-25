@@ -977,16 +977,17 @@ Rejected requests are recorded in the audit log as `refund.denied`.
 - A pending, unpaid checkout can always be cancelled. Its hold and promo
   reservation are released and the pending simulated payment is marked
   `CANCELLED`.
-- **Organizers cannot refund or cancel individual customer orders** through
-  `/orders/...` (`403`). This changes the previous behaviour, where the owner
-  could cancel a paid order without a refund. Organizers act through event
-  cancellation instead.
+- **The event owner may cancel or refund individual orders** of their own event
+  through `/orders/{id}/cancel` and `/refund` (SRS 4.9). A paid order gets a full
+  refund (`kind = ORGANIZER_REQUEST`) regardless of `refunds_enabled`, the
+  deadline or the start time; a free registration is cancelled without a
+  refund; checked-in orders are refused. Other organizers get `403`.
 
 **Organizer event cancellation** follows its own policy. Every paid order gets
 a full refund regardless of `refunds_enabled` or the deadline. Free
 registrations are cancelled without a refund, and pending checkouts are
-cancelled. Refund records carry `kind`: `CUSTOMER_REQUEST` or
-`EVENT_CANCELLATION`.
+cancelled. Refund records carry `kind`: `CUSTOMER_REQUEST`,
+`EVENT_CANCELLATION` or `ORGANIZER_REQUEST`.
 
 ### Lifecycle transitions
 
@@ -1146,13 +1147,14 @@ are in-app rows in the existing `notifications` table.
 | Method | Path | Who | Purpose |
 |---|---|---|---|
 | `POST` | `/api/v1/support/cases` | any active user | Open a case (`subject`, `category`, `message`, optional `ticket_id` / `order_id` / `event_id`, optional `case_type`) |
-| `GET` | `/api/v1/support/cases` | any active user | Accessible cases only; filters `status` (repeatable), `category`, `case_type`, `event_id`, `escalated`, `assigned_to_me`, `role=requester\|handler`, `q`; `sort`, `limit`, `offset` |
+| `GET` | `/api/v1/support/cases` | any active user | Accessible cases only; `scope=mine\|event\|all` (all: Platform Admins), filters `status` (repeatable), `category`, `case_type`, `event_id`, `escalated`, `assigned_to_me`, `role=requester\|handler`, `q`; `sort`, `limit`, `offset` |
 | `GET` | `/api/v1/support/cases/{id}` | participant | Details + caller's `access` (`relation`, `can_manage`, `can_escalate`) |
-| `GET` | `/api/v1/support/cases/{id}/messages` | participant | Oldest first; `after_sequence` (polling cursor), `before_sequence` (history), `since` (timestamp), `limit` ≤ 100 |
+| `GET` | `/api/v1/support/cases/{id}/messages` | participant | Oldest first; `after=<message_id>` or `after_sequence` (polling), `before_sequence` (history), `since` (timestamp), `limit` ≤ 100 |
 | `POST` | `/api/v1/support/cases/{id}/messages` | participant | Send a message (1–5000 chars, not blank) |
+| `PATCH` | `/api/v1/support/cases/{id}` | participant (see rules) | `{"status"?, "assignee_user_id"?, "note"?}`; omitted fields unchanged, `null` assignee unassigns; all-or-nothing |
 | `PATCH` | `/api/v1/support/cases/{id}/status` | participant (see rules) | `{"status", "note"?}` |
 | `PATCH` | `/api/v1/support/cases/{id}/assignee` | handler | `{"assignee_user_id": uuid \| null}` |
-| `GET` | `/api/v1/support/cases/{id}/assignable-users` | handler | Users the case may be assigned to |
+| `GET` | `/api/v1/support/cases/{id}/assignees` (alias `/assignable-users`) | handler | Users the case may be assigned to (`user_id`, `name`, `role`) |
 | `POST` | `/api/v1/support/cases/{id}/escalate` | requester, owner, support staff | Escalate an attendee case to Platform Admins (`{"reason"}`) |
 | `GET` | `/api/v1/support/cases/{id}/activity` | participant | Chronological lifecycle history (actor, timestamp, from/to) |
 | `GET` | `/api/v1/users/me/notifications` | self | In-app notifications (`unread_only`, paging, `unread_count`) |
@@ -1165,7 +1167,13 @@ are in-app rows in the existing `notifications` table.
   the event or a publicly visible event).
 * `PLATFORM`: an organizer (about their own event, or without context) or any
   user with an account/technical issue, and Platform Admins.
-* `ticket_id` resolves its order and event; `order_id` resolves its event. Extra
+* Case responses carry `requester`/`assignee` (`user_id`, `display_name`,
+  `name`), flat `event_id`/`order_id`/`ticket_id`/`ticket_public_id`, and nested
+  `event` (`id`, `title`), `order` (`id`, `order_number`) and `ticket` (`id`,
+  `public_id`, `ticket_type_name`). Messages carry `sender` (`user_id`,
+  `display_name`, `name`, `role`).
+* `ticket_id` accepts the ticket id or its `public_id` and resolves its order
+  and event; `order_id` resolves its event. Extra
   identifiers must agree (`422 SUPPORT_CONTEXT_MISMATCH`). Unknown and
   not-yours references both return `404 SUPPORT_CONTEXT_NOT_FOUND`.
 * Categories: `TICKET_DELIVERY`, `PAYMENT`, `REFUND`, `SEATING`,
@@ -1237,6 +1245,10 @@ duplicates collapse.
 | `GET` | `/api/v1/admin/failures` | Failed payments, failed refunds and failed outbox emails (`kind`) |
 | `GET` · `POST` | `/api/v1/admin/disputes` | List / record a dispute against a captured payment |
 | `PATCH` | `/api/v1/admin/disputes/{id}` | `OPEN → UNDER_REVIEW → RESOLVED \| REJECTED` |
+| `GET` | `/api/v1/admin/campaigns` | All campaigns (`q`: name, code, event title) with `effective_status`, `redemption_count` |
+| `GET` | `/api/v1/admin/export/{users\|events\|orders\|payments}.csv` | CSV export (≤ 10,000 rows, same `q`, formula-safe cells, audited) |
+| `POST` | `/api/v1/admin/organizers/{user_id}/verification` | `{"status": "VERIFIED\|REJECTED\|PENDING", "reason"?}` |
+| `POST` | `/api/v1/admin/payout-accounts/{id}/status` | `{"status": "ACTIVE\|BLOCKED\|PENDING", "reason"?}` |
 | `GET` | `/api/v1/admin/support/escalated` | Escalated attendee support cases |
 | `GET` | `/api/v1/admin/actions` | Administrative actions from the audit log |
 
@@ -1305,6 +1317,17 @@ fixed number of queries). The response includes `definitions`.
 
 Money is grouped per currency and never combined.
 
+`sales_over_time` (added after PR 19, additive) lists one entry per day and
+currency for the same period as `sales`: `{date, currency, orders, tickets,
+gross}`, where `gross` is list prices (no fees, like `gross_ticket_sales`). Days
+are bucketed by `orders.paid_at` in the event timezone (`scope.timezone`; UTC
+for an aggregate over several events), so a chart needs one request instead of
+one per bar.
+
+**Processing fee**: `gross_ticket_sales`, `discounts`, `ticket_revenue` and
+`sales_over_time.gross` exclude the 3% fee; `fees` is the fee; `gross_revenue`,
+`refunds` and `net_revenue` include it (refunds return the full amount charged).
+
 ### Event history and timeline
 
 * `GET /api/v1/organizers/me/events`: events the caller owns or is
@@ -1313,11 +1336,14 @@ Money is grouped per currency and never combined.
   ended), `UPCOMING` (not started). Suspension is reported as `is_suspended` and
   never changes the category. Also `status`, `q`, `suspended`,
   `starts_from/to`, `sort`, paging.
+* `GET /api/v1/events/{event_id}/audit-log`: also accepts `from`/`to`
+  (inclusive dates, event timezone) and `action_prefix`; entries add
+  `actor_name` and `entity_label` (e.g. `Order #1042`, a ticket type name).
 * `GET /api/v1/events/{event_id}/timeline` (owner or Platform Admin): the
   event's entries in the append-only audit log, newest first (`order=asc`
   available). `action` filters are repeatable (exact, or a prefix ending in `.`
   or `.*`); `entity_type`, `start`/`end` and paging are also available. Each
-  entry has actor (id, type, name), timestamp, action, entity type/id and a
+  entry has actor (id, type, name), timestamp, action, entity type/id/label and a
   redacted description (no raw payloads). Access-denied probes are excluded,
   and nothing is synthesized for actions that were never recorded.
 
@@ -1330,3 +1356,41 @@ value, the message `sequence`/`sender_role` columns (backfilled by
 `audit_logs`), user/event/paid-sales suspension columns, the
 `payment_disputes` table, and read-path indexes. Additive; nothing is dropped.
 Apply with `make migrate` (or on startup).
+
+## Frontend request (SCRUM-21/23/24/25)
+
+* **Organizer cancel/refund**: `POST /orders/{id}/cancel` and `/refund` accept
+  the event owner (and Platform Admins) as well as the buyer. Owner refunds are
+  full refunds (`kind = ORGANIZER_REQUEST`) that bypass the customer policy,
+  deadline and start-time check; checked-in orders are still refused. Free
+  registrations are cancelled without a refund. Other organizers get 403.
+* **Demo self-service** (`DEMO_SIMULATIONS_ENABLED`, default `true`; DEMO ONLY,
+  audited): `POST /organizers/me/verification/simulate` (profile → VERIFIED),
+  `POST /organizers/me/payout-account/simulate-approval` (account → ACTIVE),
+  `GET /organizers/me/payout-account` (default or newest, reference masked).
+  With the flag off, Platform Admins use the admin routes above.
+* **Event page**: `GET /events/{id}/ticket-types` items have `available`
+  (capacity − sold − active holds, capped by remaining event capacity; public).
+  `GET /events/{id}` has `paid_sales_active` (activated, not stopped, event not
+  suspended).
+* **Attendees**: `POST /orders` accepts optional
+  `attendees: [{ticket_type_id, full_name, email}]`, exactly one per ticket
+  (422 otherwise). Omitted: every ticket is issued to the buyer, as before.
+* **Campaign analytics** responses include `tickets_sold` (tickets of
+  attributed orders that are currently PAID/CONFIRMED).
+* **COMPLETED**: the background loop moves PUBLISHED events whose `ends_at` has
+  passed to `COMPLETED` (audited as `SYSTEM`, `event.completed`).
+* **Support** (all additive to PR 19): `ticket_public_id` and nested `event`,
+  `order`, `ticket` objects on cases; `name` next to `display_name` on people;
+  `scope=mine|event|all`; `?after=<message_id>`; combined
+  `PATCH /support/cases/{id}`; `/assignees`. Categories unchanged
+  (`EVENT_INFORMATION`, ...).
+* **First Platform Admin**: register and verify an account through the API,
+  then on the server run `make admin EMAIL=you@example.com`
+  (`python -m app.db.bootstrap_admin --email ...`; in Docker:
+  `docker compose exec api python -m app.db.bootstrap_admin --email ...`).
+  It promotes the existing account (idempotent, audited as SYSTEM); there is
+  no HTTP route for this by design.
+* **Migration**: `sql/migrate_010_organizer_refunds.sql` widens
+  `refunds_kind_valid` with `ORGANIZER_REQUEST`. `migrate_009` is unchanged
+  from PR 19 (already applied in deployments).

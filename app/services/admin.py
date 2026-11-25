@@ -27,6 +27,7 @@ from app.core.errors import ApiError
 from app.db import repositories as repo
 from app.db.models import (
     AuditLog,
+    Campaign,
     DisputeStatus,
     Event,
     EventSalesActivation,
@@ -38,27 +39,35 @@ from app.db.models import (
     Payment,
     PaymentDispute,
     PaymentStatus,
+    PayoutAccount,
+    PayoutStatus,
     Refund,
     RefundStatus,
     SupportCase,
     User,
     UserRole,
     UserStatus,
+    VerificationStatus,
 )
 from app.schemas.admin import (
+    ActivationChecklist,
     AdminActionResponse,
     AdminActivationResponse,
+    AdminCampaignResponse,
     AdminEventResponse,
     AdminOrderResponse,
     AdminPaymentResponse,
     AdminRefundResponse,
     AdminUserResponse,
     DisputeResponse,
+    EventRef,
     OperationalFailureResponse,
     Page,
+    PersonRef,
 )
 from app.services import notifications
 from app.services.analytics import validate_range
+from app.services.campaigns import effective_status
 
 logger = logging.getLogger("app.admin")
 
@@ -133,7 +142,9 @@ async def _audit(
 
 def _user_response(user: User, profile: OrganizerProfile | None) -> AdminUserResponse:
     return AdminUserResponse(
+        id=user.id,
         user_id=user.id,
+        name=f"{user.first_name} {user.last_name}".strip(),
         email=user.email,
         first_name=user.first_name,
         last_name=user.last_name,
@@ -272,7 +283,10 @@ async def unsuspend_user(
 def _event_query() -> Any:
     owner = aliased(User)
     return (
-        select(Event, owner.email, OrganizerProfile.display_name, EventSalesActivation)
+        select(
+            Event, owner.email, OrganizerProfile.display_name, EventSalesActivation,
+            owner.first_name, owner.last_name,
+        )
         .outerjoin(owner, owner.id == Event.owner_user_id)
         .outerjoin(OrganizerProfile, OrganizerProfile.user_id == Event.owner_user_id)
         .outerjoin(EventSalesActivation, EventSalesActivation.event_id == Event.id)
@@ -280,10 +294,12 @@ def _event_query() -> Any:
 
 
 def _event_response(row: Any) -> AdminEventResponse:
-    event, owner_email, display_name, activation = row
+    event, owner_email, display_name, activation, first, last = row
+    owner_name = display_name or f"{first or ''} {last or ''}".strip()
     return AdminEventResponse(
         id=event.id,
         title=event.title,
+        owner=PersonRef(id=event.owner_user_id, name=owner_name),
         owner_user_id=event.owner_user_id,
         owner_email=owner_email,
         organizer_display_name=display_name,
@@ -558,7 +574,9 @@ async def search_orders(
     )
     items = [
         AdminOrderResponse(
-            id=o.id, order_number=o.order_number, event_id=o.event_id, event_title=title,
+            id=o.id, order_number=o.order_number,
+            event=EventRef(id=o.event_id, title=title) if title is not None else None,
+            event_id=o.event_id, event_title=title,
             buyer_user_id=o.buyer_user_id, buyer_email=o.buyer_email, status=o.status.value,
             currency=o.currency, subtotal_amount=o.subtotal_amount,
             discount_amount=o.discount_amount, fee_amount=o.fee_amount,
@@ -647,9 +665,14 @@ def _activation_status(activation: EventSalesActivation) -> str:
 
 
 async def list_activations(
-    db: AsyncSession, *, status: str | None, limit: int, offset: int
+    db: AsyncSession, *, status: str | None, q: str | None, limit: int, offset: int
 ) -> Page[AdminActivationResponse]:
     conditions: list[Any] = []
+    if q:
+        conditions.append(or_(
+            Event.title.ilike(_pattern(q), escape="\\"),
+            OrganizerProfile.display_name.ilike(_pattern(q), escape="\\"),
+        ))
     if status == "SUSPENDED":
         conditions.append(EventSalesActivation.sales_suspended_at.is_not(None))
     elif status == "ACTIVE":
@@ -662,19 +685,42 @@ async def list_activations(
             EventSalesActivation.activated_at.is_(None),
             EventSalesActivation.sales_suspended_at.is_(None),
         ]
+    payout_ok = (
+        select(PayoutAccount.id)
+        .where(
+            PayoutAccount.organizer_user_id == Event.owner_user_id,
+            PayoutAccount.status == PayoutStatus.ACTIVE,
+        )
+        .correlate(Event)
+        .exists()
+    )
     rows, total = await _page(
         db,
         select(EventSalesActivation, Event.title, Event.owner_user_id,
-               OrganizerProfile.display_name, OrganizerProfile.verification_status)
+               OrganizerProfile.display_name, OrganizerProfile.verification_status,
+               payout_ok)
         .outerjoin(Event, Event.id == EventSalesActivation.event_id)
         .outerjoin(OrganizerProfile, OrganizerProfile.user_id == Event.owner_user_id)
         .where(*conditions),
-        select(func.count(EventSalesActivation.event_id)).where(*conditions),
+        select(func.count(EventSalesActivation.event_id))
+        .outerjoin(Event, Event.id == EventSalesActivation.event_id)
+        .outerjoin(OrganizerProfile, OrganizerProfile.user_id == Event.owner_user_id)
+        .where(*conditions),
         order=(EventSalesActivation.updated_at.desc(), EventSalesActivation.event_id.desc()),
         limit=limit, offset=offset,
     )
     items = [
         AdminActivationResponse(
+            event=EventRef(id=a.event_id, title=title) if title is not None else None,
+            organizer=(
+                PersonRef(id=owner_id, name=display_name or "") if owner_id is not None else None
+            ),
+            checklist=ActivationChecklist(
+                verification_complete=verification == VerificationStatus.VERIFIED,
+                payout_account_complete=bool(has_payout),
+                activation_fee_paid=a.activation_fee_paid_at is not None,
+                terms_accepted=a.terms_accepted_at is not None,
+            ),
             event_id=a.event_id, event_title=title, owner_user_id=owner_id,
             organizer_display_name=display_name,
             organizer_verification_status=verification.value if verification else None,
@@ -685,7 +731,7 @@ async def list_activations(
             sales_suspension_reason=a.sales_suspension_reason,
             created_at=a.created_at, updated_at=a.updated_at,
         )
-        for a, title, owner_id, display_name, verification in rows
+        for a, title, owner_id, display_name, verification, has_payout in rows
     ]
     return Page[AdminActivationResponse](items=items, total=total, limit=limit, offset=offset)
 
@@ -700,9 +746,18 @@ async def list_refunds(
     created_to: datetime | None,
     limit: int,
     offset: int,
+    q: str | None = None,
 ) -> Page[AdminRefundResponse]:
     created_from, created_to = validate_range(created_from, created_to)
     conditions: list[Any] = []
+    if q:
+        clauses: list[Any] = [
+            Event.title.ilike(_pattern(q), escape="\\"),
+            Order.buyer_email.ilike(_pattern(q), escape="\\"),
+        ]
+        if q.strip().isdigit():
+            clauses.append(Order.order_number == int(q.strip()))
+        conditions.append(or_(*clauses))
     if status is not None:
         conditions.append(Refund.status == status)
     if kind:
@@ -715,20 +770,23 @@ async def list_refunds(
         conditions.append(Refund.created_at < created_to)
     rows, total = await _page(
         db,
-        select(Refund, Order.order_number, Order.event_id)
-        .join(Order, Order.id == Refund.order_id).where(*conditions),
-        select(func.count(Refund.id)).join(Order, Order.id == Refund.order_id).where(*conditions),
+        select(Refund, Order.order_number, Order.event_id, Event.title)
+        .join(Order, Order.id == Refund.order_id)
+        .outerjoin(Event, Event.id == Order.event_id).where(*conditions),
+        select(func.count(Refund.id)).join(Order, Order.id == Refund.order_id)
+        .outerjoin(Event, Event.id == Order.event_id).where(*conditions),
         order=(Refund.created_at.desc(), Refund.id.desc()),
         limit=limit, offset=offset,
     )
     items = [
         AdminRefundResponse(
-            id=r.id, order_id=r.order_id, order_number=number, event_id=ev,
+            id=r.id, order_id=r.order_id, order_number=number,
+            event=EventRef(id=ev, title=title) if title is not None else None, event_id=ev,
             payment_id=r.payment_id, amount=r.amount, currency=r.currency,
             status=r.status.value, kind=r.kind, reason=r.reason, is_simulated=r.is_simulated,
             initiated_by=r.initiated_by, created_at=r.created_at, completed_at=r.completed_at,
         )
-        for r, number, ev in rows
+        for r, number, ev, title in rows
     ]
     return Page[AdminRefundResponse](items=items, total=total, limit=limit, offset=offset)
 
@@ -979,3 +1037,120 @@ async def update_dispute(
     )
     await db.flush()
     return _dispute_response(dispute)
+
+
+# ---------- Campaigns ----------
+
+async def list_campaigns(
+    db: AsyncSession, *, q: str | None, event_id: UUID | None, limit: int, offset: int
+) -> Page[AdminCampaignResponse]:
+    conditions: list[Any] = []
+    if q:
+        conditions.append(or_(
+            Campaign.name.ilike(_pattern(q), escape="\\"),
+            Campaign.promo_code.ilike(_pattern(q), escape="\\"),
+            Event.title.ilike(_pattern(q), escape="\\"),
+        ))
+    if event_id is not None:
+        conditions.append(Campaign.event_id == event_id)
+    rows, total = await _page(
+        db,
+        select(Campaign, Event.title).outerjoin(Event, Event.id == Campaign.event_id)
+        .where(*conditions),
+        select(func.count(Campaign.id)).outerjoin(Event, Event.id == Campaign.event_id)
+        .where(*conditions),
+        order=(Campaign.created_at.desc(), Campaign.id.desc()),
+        limit=limit, offset=offset,
+    )
+    now = _now()
+    items = [
+        AdminCampaignResponse(
+            id=c.id,
+            event=EventRef(id=c.event_id, title=title) if title is not None else None,
+            name=c.name, code=c.promo_code, status=c.status.value,
+            effective_status=effective_status(c, now),
+            discount_type=c.discount_type.value, discount_value=c.discount_value,
+            redemption_count=c.redemption_count, redemption_limit=c.max_redemptions,
+            starts_at=c.starts_at, ends_at=c.ends_at, created_at=c.created_at,
+        )
+        for c, title in rows
+    ]
+    return Page[AdminCampaignResponse](items=items, total=total, limit=limit, offset=offset)
+
+
+# ---------- CSV export ----------
+
+EXPORT_MAX_ROWS = 10_000
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_cell(value: Any) -> str:
+    """Stringify one cell; neutralize spreadsheet formula injection."""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    text = value.value if hasattr(value, "value") and not isinstance(value, Decimal) else value
+    text = str(text)
+    if text.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + text
+    return text
+
+
+EXPORT_COLUMNS: dict[str, list[str]] = {
+    "users": ["id", "email", "name", "global_role", "status", "is_organizer",
+              "email_verified_at", "suspended_at", "created_at"],
+    "events": ["id", "title", "owner_id", "owner_name", "status", "is_suspended",
+               "starts_at", "ends_at", "city", "capacity", "created_at"],
+    "orders": ["id", "order_number", "event_id", "event_title", "buyer_email", "status",
+               "currency", "subtotal_amount", "discount_amount", "fee_amount", "total_amount",
+               "promo_code", "paid_at", "created_at"],
+    "payments": ["id", "order_id", "order_number", "event_id", "provider", "amount",
+                 "currency", "status", "failure_code", "is_simulated", "paid_at",
+                 "created_at"],
+}
+
+
+async def export_rows(db: AsyncSession, kind: str, *, q: str | None) -> list[list[str]]:
+    """Rows for ``/admin/export/{kind}.csv`` (header first), newest first.
+
+    Reuses the search functions in pages, so filters and redaction match the
+    JSON listings (no password hashes, tokens or account references).
+    """
+    rows: list[list[str]] = [EXPORT_COLUMNS[kind]]
+    page_size = 100
+    offset = 0
+    while offset < EXPORT_MAX_ROWS:
+        values: list[list[Any]]
+        if kind == "users":
+            page_u = await search_users(db, q=q, status=None, role=None, is_organizer=None,
+                                        sort="-created_at", limit=page_size, offset=offset)
+            values = [[u.id, u.email, u.name, u.global_role, u.status, u.is_organizer,
+                       u.email_verified_at, u.suspended_at, u.created_at] for u in page_u.items]
+        elif kind == "events":
+            page_e = await search_events(db, q=q, status=None, suspended=None,
+                                         owner_user_id=None, starts_from=None, starts_to=None,
+                                         sort="-created_at", limit=page_size, offset=offset)
+            values = [[e.id, e.title, e.owner_user_id, e.owner.name if e.owner else None,
+                       e.status, e.is_suspended, e.starts_at, e.ends_at, e.city, e.capacity,
+                       e.created_at] for e in page_e.items]
+        elif kind == "orders":
+            page_o = await search_orders(db, q=q, status=None, event_id=None, buyer_user_id=None,
+                                         created_from=None, created_to=None, sort="-created_at",
+                                         limit=page_size, offset=offset)
+            values = [[o.id, o.order_number, o.event_id, o.event_title, o.buyer_email, o.status,
+                       o.currency, o.subtotal_amount, o.discount_amount, o.fee_amount,
+                       o.total_amount, o.promo_code, o.paid_at, o.created_at]
+                      for o in page_o.items]
+        else:
+            page_p = await search_payments(db, q=q, status=None, provider=None, order_id=None,
+                                           event_id=None, created_from=None, created_to=None,
+                                           sort="-created_at", limit=page_size, offset=offset)
+            values = [[p.id, p.order_id, p.order_number, p.event_id, p.provider, p.amount,
+                       p.currency, p.status, p.failure_code, p.is_simulated, p.paid_at,
+                       p.created_at] for p in page_p.items]
+        rows.extend([[_csv_cell(v) for v in row] for row in values])
+        if len(values) < page_size:
+            break
+        offset += page_size
+    return rows[: EXPORT_MAX_ROWS + 1]

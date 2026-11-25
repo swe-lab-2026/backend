@@ -584,6 +584,21 @@ async def test_analytics_figures_match_order_payment_and_refund_records(client, 
     agg = (await _get(client, owner_token, "/organizers/me/analytics")).json()
     assert agg["sales"] == data["sales"]
 
+    # Daily breakdown (one request instead of one per chart bar).
+    assert data["scope"]["timezone"] == "UTC"
+    points = data["sales_over_time"]
+    assert {p["currency"] for p in points} == {"KZT"}
+    assert sum(p["orders"] for p in points) == kzt["orders"]
+    assert sum(p["tickets"] for p in points) == kzt["tickets_sold"]
+    assert sum(Decimal(p["gross"]) for p in points) == Decimal(kzt["gross_ticket_sales"])
+    assert later["sales_over_time"] == []
+
+    # Campaign analytics endpoint (SCRUM-15) reports tickets_sold.
+    campaign_stats = (await _get(
+        client, owner_token,
+        f"/events/{event['id']}/campaigns/{campaign['campaign_id']}/analytics")).json()
+    assert campaign_stats["tickets_sold"] == 2
+
 
 async def test_attendance_ignores_repeated_and_reversed_check_ins(client, app, db):
     owner_token, event, free_type = await _free_event(client, app, db, "att", capacity=10)
@@ -733,7 +748,7 @@ async def test_event_timeline_ordering_filters_and_redaction(client, app, db):
     assert stamps == sorted(stamps, reverse=True)
     for entry in timeline["items"]:
         assert set(entry) == {"id", "timestamp", "action", "entity_type", "entity_id",
-                              "actor", "description"}
+                              "entity_label", "actor", "description"}
         assert entry["description"]
     admin_entry = next(e for e in timeline["items"] if e["action"] == "admin.paid_sales_stopped")
     assert admin_entry["actor"] == {"user_id": str(admin.id), "type": "PLATFORM_ADMIN",
@@ -741,6 +756,12 @@ async def test_event_timeline_ordering_filters_and_redaction(client, app, db):
     payment_entry = next(e for e in timeline["items"] if e["action"] == "payment.state_changed")
     assert payment_entry["description"] == "Payment changed from PENDING to SUCCEEDED"
     assert payment_entry["entity_type"] == "payment"
+    assert payment_entry["entity_label"] == f"Payment for order #{order['order_number']}"
+    order_entry = next(e for e in timeline["items"] if e["action"] == "order.created")
+    assert order_entry["entity_label"] == f"Order #{order['order_number']}"
+    tt_entry = next(e for e in timeline["items"]
+                    if e["action"] == "ticket_type.created" and e["entity_id"] == ga["id"])
+    assert tt_entry["entity_label"] == ga["name"]
 
     asc = (await _get(client, owner_token, path, order="asc", limit=200)).json()
     assert [e["id"] for e in asc["items"]] == [e["id"] for e in reversed(timeline["items"])]

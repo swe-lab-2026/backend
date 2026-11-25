@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from uuid import UUID
 
@@ -11,6 +11,8 @@ class AnalyticsScope(BaseModel):
     ticket_type_id: UUID | None
     start: datetime | None
     end: datetime | None
+    # Time zone used to bucket sales_over_time by day.
+    timezone: str = "UTC"
     generated_at: datetime
 
 
@@ -97,12 +99,24 @@ class CampaignMetrics(BaseModel):
     sales: list[CampaignSales]
 
 
+class SalesOverTimePoint(BaseModel):
+    """One day of realized sales (orders.paid_at in ``scope.timezone``)."""
+
+    date: date
+    currency: str
+    orders: int
+    tickets: int
+    gross: Decimal  # list prices, no fees
+
+
 class AnalyticsResponse(BaseModel):
     scope: AnalyticsScope
     definitions: dict[str, str]
     capacity: CapacitySnapshot
     attendance: AttendanceMetrics
     sales: list[CurrencySales]
+    # Daily breakdown of ``sales`` for charts (added after PR 19; additive).
+    sales_over_time: list[SalesOverTimePoint] = []
     ticket_types: list[TicketTypeMetrics]
     campaigns: list[CampaignMetrics]
 
@@ -147,6 +161,7 @@ class TimelineEntry(BaseModel):
     action: str
     entity_type: str
     entity_id: UUID | None
+    entity_label: str | None = None
     actor: TimelineActor
     description: str
 

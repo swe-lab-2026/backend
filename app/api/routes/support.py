@@ -15,6 +15,7 @@ from app.schemas.support import (
     SupportCasePage,
     SupportCaseResponse,
     SupportCaseStatusValue,
+    SupportCaseUpdate,
     SupportEscalationRequest,
     SupportMessageCreate,
     SupportMessagePage,
@@ -47,6 +48,7 @@ async def list_support_cases(
     escalated: bool | None = None,
     assigned_to_me: bool = False,
     role: Literal["requester", "handler"] | None = None,
+    scope: Literal["mine", "event", "all"] | None = None,
     q: str | None = Query(default=None, min_length=1, max_length=100),
     sort: Literal["-updated_at", "updated_at", "-created_at", "created_at"] = "-updated_at",
     limit: int = Query(default=20, ge=1, le=100),
@@ -54,7 +56,11 @@ async def list_support_cases(
     user: User = Depends(require_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> SupportCasePage:
-    """Only cases the caller may access are ever returned or counted."""
+    """Only cases the caller may access are ever returned or counted.
+
+    ``scope``: ``mine`` (cases I opened), ``event`` (attendee cases of events I
+    own or staff), ``all`` (Platform Admins: platform and escalated cases).
+    """
     return await service.list_cases(
         db,
         user,
@@ -65,6 +71,7 @@ async def list_support_cases(
         escalated=escalated,
         assigned_to_me=assigned_to_me,
         role=role,
+        scope=scope,
         q=q,
         sort=sort,
         limit=limit,
@@ -85,6 +92,7 @@ async def get_support_case(
 @router.get("/{case_id}/messages", response_model=SupportMessagePage)
 async def list_support_messages(
     case_id: UUID,
+    after: UUID | None = Query(default=None, description="Return messages after this message id"),
     after_sequence: int | None = Query(default=None, ge=0),
     before_sequence: int | None = Query(default=None, ge=1),
     since: datetime | None = None,
@@ -94,8 +102,9 @@ async def list_support_messages(
 ) -> SupportMessagePage:
     """Conversation history, oldest first.
 
-    Polling: pass the previous ``next_cursor`` as ``after_sequence`` (or a
-    timestamp as ``since``) to receive only newer messages.
+    Polling: pass the id of the newest message you have as ``after`` (or the
+    previous ``next_cursor`` as ``after_sequence``, or a timestamp as
+    ``since``) to receive only newer messages.
     """
     return await service.list_messages(
         db,
@@ -105,6 +114,7 @@ async def list_support_messages(
         before_sequence=before_sequence,
         since=as_utc_param(since),
         limit=limit,
+        after_message_id=after,
     )
 
 
@@ -116,6 +126,25 @@ async def send_support_message(
     db: AsyncSession = Depends(get_db),
 ) -> SupportMessageResponse:
     return await service.post_message(db, user, case_id, payload.body)
+
+
+@router.patch("/{case_id}", response_model=SupportCaseResponse)
+async def update_support_case(
+    case_id: UUID,
+    payload: SupportCaseUpdate,
+    user: User = Depends(require_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> SupportCaseResponse:
+    """Change status and/or assignee in one call. Omitted fields are unchanged;
+    ``"assignee_user_id": null`` unassigns."""
+    case, access = await service.update_case(
+        db, user, case_id,
+        status=SupportCaseStatus(payload.status.value) if payload.status else None,
+        assignee_user_id=payload.assignee_user_id,
+        assignee_given="assignee_user_id" in payload.model_fields_set,
+        note=payload.note,
+    )
+    return await service.build_case_response(db, case, access)
 
 
 @router.patch("/{case_id}/status", response_model=SupportCaseResponse)
@@ -142,6 +171,7 @@ async def assign_support_case(
     return await service.build_case_response(db, case, access)
 
 
+@router.get("/{case_id}/assignees", response_model=list[SupportAssignableUser])
 @router.get("/{case_id}/assignable-users", response_model=list[SupportAssignableUser])
 async def list_assignable_users(
     case_id: UUID,

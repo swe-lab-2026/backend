@@ -39,6 +39,7 @@ from app.db.models import (
     EventStaff,
     EventStaffRole,
     Order,
+    OrderItem,
     SupportCase,
     SupportCaseStatus,
     SupportCaseType,
@@ -56,10 +57,13 @@ from app.schemas.support import (
     SupportCaseCreate,
     SupportCasePage,
     SupportCaseResponse,
+    SupportEventRef,
     SupportMessagePage,
     SupportMessageResponse,
     SupportMessageSender,
+    SupportOrderRef,
     SupportParticipant,
+    SupportTicketRef,
 )
 from app.services import events as event_service
 from app.services import notifications
@@ -211,6 +215,17 @@ def _visibility_clause(user: User) -> Any:
             and_(SupportCase.case_type == _AO, SupportCase.escalated_at.is_not(None))
         )
     return or_(*clauses)
+
+
+def _organizer_handler_clause(user: User) -> Any:
+    """Attendee cases of events the user owns or supports as staff."""
+    owned_events = select(Event.id).where(Event.owner_user_id == user.id)
+    staffed_events = select(EventStaff.event_id).where(
+        EventStaff.user_id == user.id, EventStaff.role.in_(SUPPORT_STAFF_ROLES)
+    )
+    return or_(
+        SupportCase.event_id.in_(owned_events), SupportCase.event_id.in_(staffed_events)
+    )
 
 
 def _handler_clause(user: User) -> Any:
@@ -375,7 +390,10 @@ async def _resolve_context(
     """
     ctx = _Context()
     if payload.ticket_id is not None:
-        ticket = await db.get(Ticket, payload.ticket_id)
+        # Clients may hold either the ticket id or its public id.
+        ticket = await db.get(Ticket, payload.ticket_id) or await repo.get_ticket_by_public_id(
+            db, payload.ticket_id
+        )
         row = (
             await repo.get_ticket_order_item(db, ticket) if ticket is not None else None
         )
@@ -446,6 +464,8 @@ async def _resolve_context(
 def _case_query() -> tuple[Select[Any], Any, Any]:
     requester = aliased(User)
     assignee = aliased(User)
+    ticket = aliased(Ticket)
+    item = aliased(OrderItem)
     message_count = (
         select(func.coalesce(func.max(SupportMessage.sequence), 0))
         .where(SupportMessage.case_id == SupportCase.id)
@@ -453,9 +473,14 @@ def _case_query() -> tuple[Select[Any], Any, Any]:
         .scalar_subquery()
     )
     stmt = (
-        select(SupportCase, Event.title, Order.order_number, requester, assignee, message_count)
+        select(
+            SupportCase, Event.title, Order.order_number, requester, assignee, message_count,
+            ticket.public_id, item.ticket_type_name,
+        )
         .outerjoin(Event, Event.id == SupportCase.event_id)
         .outerjoin(Order, Order.id == SupportCase.order_id)
+        .outerjoin(ticket, ticket.id == SupportCase.ticket_id)
+        .outerjoin(item, item.id == ticket.order_item_id)
         .outerjoin(requester, requester.id == SupportCase.requester_user_id)
         .outerjoin(assignee, assignee.id == SupportCase.assignee_user_id)
     )
@@ -465,11 +490,13 @@ def _case_query() -> tuple[Select[Any], Any, Any]:
 def _participant(user: User | None) -> SupportParticipant | None:
     if user is None:
         return None
-    return SupportParticipant(user_id=user.id, display_name=display_name(user) or "")
+    return SupportParticipant(user_id=user.id, display_name=display_name(user) or "",
+                              name=display_name(user) or "")
 
 
 def _case_response(row: Any, access: CaseAccess | None = None) -> SupportCaseResponse:
-    case, event_title, order_number, requester, assignee, message_count = row
+    (case, event_title, order_number, requester, assignee, message_count,
+     ticket_public_id, ticket_type_name) = row
     status = case.status.value
     return SupportCaseResponse(
         id=case.id,
@@ -479,11 +506,26 @@ def _case_response(row: Any, access: CaseAccess | None = None) -> SupportCaseRes
         status=status,
         requester=_participant(requester),
         assignee=_participant(assignee),
+        event=(
+            SupportEventRef(id=case.event_id, title=event_title)
+            if case.event_id is not None and event_title is not None else None
+        ),
+        order=(
+            SupportOrderRef(id=case.order_id, order_number=order_number)
+            if case.order_id is not None and order_number is not None else None
+        ),
+        ticket=(
+            SupportTicketRef(
+                id=case.ticket_id, public_id=ticket_public_id, ticket_type_name=ticket_type_name
+            )
+            if case.ticket_id is not None and ticket_public_id is not None else None
+        ),
         event_id=case.event_id,
         event_title=event_title,
         order_id=case.order_id,
         order_number=order_number,
         ticket_id=case.ticket_id,
+        ticket_public_id=ticket_public_id,
         is_escalated=case.escalated_at is not None,
         escalated_at=case.escalated_at,
         escalation_reason=case.escalation_reason,
@@ -587,6 +629,7 @@ async def list_cases(
     escalated: bool | None = None,
     assigned_to_me: bool = False,
     role: str | None = None,
+    scope: str | None = None,
     q: str | None = None,
     sort: str = "-updated_at",
     limit: int = 20,
@@ -608,6 +651,15 @@ async def list_cases(
         conditions.append(SupportCase.escalated_at.is_(None))
     if assigned_to_me:
         conditions.append(SupportCase.assignee_user_id == user.id)
+    # Frontend scopes: mine = cases I opened; event = attendee cases of events
+    # I manage; all = everything a Platform Admin may access.
+    if scope == "mine":
+        conditions.append(SupportCase.requester_user_id == user.id)
+    elif scope == "event":
+        conditions.append(SupportCase.case_type == _AO)
+        conditions.append(_organizer_handler_clause(user))
+    elif scope == "all" and not _is_admin(user):
+        raise ApiError(403, "INSUFFICIENT_PERMISSIONS", "scope=all is for Platform Admins")
     if role == "requester":
         conditions.append(SupportCase.requester_user_id == user.id)
     elif role == "handler":
@@ -649,8 +701,18 @@ async def list_messages(
     before_sequence: int | None,
     since: datetime | None,
     limit: int,
+    after_message_id: UUID | None = None,
 ) -> SupportMessagePage:
     case, _access = await _load_case(db, user, case_id)
+    if after_message_id is not None:
+        anchor = await db.scalar(
+            select(SupportMessage.sequence).where(
+                SupportMessage.id == after_message_id, SupportMessage.case_id == case.id
+            )
+        )
+        if anchor is None:
+            raise ApiError(404, "SUPPORT_MESSAGE_NOT_FOUND", "Message not found in this case")
+        after_sequence = max(after_sequence or 0, int(anchor))
     if after_sequence is not None and before_sequence is not None:
         raise ApiError(
             422, "VALIDATION_ERROR", "Use either after_sequence or before_sequence, not both"
@@ -691,7 +753,7 @@ async def list_messages(
             sequence=message.sequence,
             sender=SupportMessageSender(
                 user_id=message.sender_user_id,
-                display_name=display_name(author),
+                display_name=display_name(author), name=display_name(author),
                 role=message.sender_role,
             ),
             body=message.body,
@@ -789,7 +851,8 @@ async def post_message(
         case_id=case.id,
         sequence=sequence,
         sender=SupportMessageSender(
-            user_id=user.id, display_name=display_name(user), role=access.relation
+            user_id=user.id, display_name=display_name(user), name=display_name(user),
+            role=access.relation
         ),
         body=message.body,
         created_at=message.created_at,
@@ -897,7 +960,10 @@ async def list_assignable(
     if not access.is_handler:
         raise ApiError(403, "SUPPORT_ASSIGN_FORBIDDEN", "Only case handlers can assign cases")
     return [
-        SupportAssignableUser(user_id=u.id, display_name=display_name(u) or "", role=role)
+        SupportAssignableUser(
+            user_id=u.id, display_name=display_name(u) or "", name=display_name(u) or "",
+            role=role,
+        )
         for u, role in await eligible_assignees(db, case)
     ]
 
@@ -1027,7 +1093,7 @@ async def list_activity(
                 action=entry.action,
                 actor=SupportMessageSender(
                     user_id=entry.actor_user_id,
-                    display_name=display_name(author),
+                    display_name=display_name(author), name=display_name(author),
                     role=entry.actor_type,
                 ),
                 description=_describe(entry.action, before, after),
@@ -1040,3 +1106,28 @@ async def list_activity(
         )
     return SupportActivityPage(items=items, total=total, limit=limit, offset=offset)
 
+
+
+async def update_case(
+    db: AsyncSession,
+    user: User,
+    case_id: UUID,
+    *,
+    status: SupportCaseStatus | None,
+    assignee_user_id: UUID | None,
+    assignee_given: bool,
+    note: str | None,
+) -> tuple[SupportCase, CaseAccess]:
+    """Combined PATCH: optional (re)assignment and/or status change.
+
+    Same rules, audit entries and notifications as the dedicated endpoints;
+    one transaction, so a rejected part rolls the whole request back.
+    """
+    if status is None and not assignee_given:
+        raise ApiError(422, "VALIDATION_ERROR", "Provide status and/or assignee_user_id")
+    case, access = await _load_case(db, user, case_id)
+    if assignee_given:
+        case, access = await assign_case(db, user, case_id, assignee_user_id)
+    if status is not None:
+        case, access = await update_status(db, user, case_id, status, note)
+    return case, access

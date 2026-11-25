@@ -182,6 +182,8 @@ class CampaignAnalyticsResponse(BaseModel):
     released_redemptions: int
     discount_total: Decimal
     attributed_order_count: int
+    # Tickets in attributed orders that are currently PAID/CONFIRMED (SRS 4.14).
+    tickets_sold: int = 0
     attributed_revenue: Decimal
     gross_attributed_order_count: int
     gross_attributed_revenue: Decimal

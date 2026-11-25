@@ -22,6 +22,7 @@ REAL_FILES = [str(SQL_DIR / name) for name in (
     "migrate_007_campaigns.sql",
     "migrate_008_refunds_audit.sql",
     "migrate_009_support_admin_analytics.sql",
+    "migrate_010_organizer_refunds.sql",
 )]
 REAL_VERSIONS = [Path(f).name for f in REAL_FILES]
 

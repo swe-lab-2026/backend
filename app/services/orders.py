@@ -315,19 +315,38 @@ async def create_order(
             completed=is_free,
         )
 
-    attendee = Attendee(
+    buyer_attendee = Attendee(
         user_id=user.id,
         full_name=f"{user.first_name} {user.last_name}".strip(),
         email=user.email,
         phone=user.phone,
     )
-    db.add(attendee)
+    # Optional per-ticket attendees (validated by the schema: one per ticket).
+    named: dict[UUID, list[Attendee]] = {}
+    requested_attendees = None if isinstance(payload, UUID) else payload.attendees
+    if requested_attendees:
+        for entry in requested_attendees:
+            same_person = entry.email.strip().lower() == user.email.lower()
+            named.setdefault(entry.ticket_type_id, []).append(
+                Attendee(
+                    user_id=user.id if same_person else None,
+                    full_name=entry.full_name,
+                    email=entry.email.strip().lower(),
+                )
+            )
+        db.add_all([a for group in named.values() for a in group])
+    else:
+        db.add(buyer_attendee)
     await db.flush()
 
     order_items: list[OrderItem] = []
     for ticket_type, quantity in prepared:
         unit_discounts = list(discount.per_unit.get(ticket_type.id, [])) if discount else []
+        attendees_for_type = named.get(ticket_type.id, [])
         for index in range(quantity):
+            attendee = (
+                attendees_for_type[index] if index < len(attendees_for_type) else buyer_attendee
+            )
             unit_discount = (
                 unit_discounts[index] if index < len(unit_discounts) else Decimal("0.00")
             )

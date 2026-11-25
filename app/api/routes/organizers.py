@@ -2,11 +2,12 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db, require_active_user, require_verified_user
-from app.db.models import EventStatus, OrganizerProfile, PayoutAccount, User
+from app.core.errors import ApiError
+from app.db.models import Event, EventStatus, OrganizerProfile, PayoutAccount, User
 from app.schemas.analytics import AnalyticsResponse, EventHistoryPage
 from app.schemas.organizers import (
     OrganizerProfileCreate,
@@ -76,6 +77,43 @@ async def update_organizer_profile(
     return _profile_response(profile)
 
 
+def _demo_enabled(request: Request) -> None:
+    if not request.app.state.settings.demo_simulations_enabled:
+        raise ApiError(403, "DEMO_SIMULATION_DISABLED",
+                       "Demo simulations are disabled; ask a Platform Admin")
+
+
+@router.post("/me/verification/simulate", response_model=OrganizerProfileResponse)
+async def simulate_organizer_verification(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_verified_user),
+) -> OrganizerProfileResponse:
+    """DEMO ONLY: mark the caller's organizer profile VERIFIED (no KYC happens)."""
+    _demo_enabled(request)
+    return _profile_response(await service.simulate_verification(db, user))
+
+
+@router.get("/me/payout-account", response_model=PayoutAccountResponse)
+async def get_payout_account(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_verified_user),
+) -> PayoutAccountResponse:
+    """The default payout account (or the most recent one). Reference is masked."""
+    return _payout_response(await service.get_payout_account(db, user))
+
+
+@router.post("/me/payout-account/simulate-approval", response_model=PayoutAccountResponse)
+async def simulate_payout_approval(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_verified_user),
+) -> PayoutAccountResponse:
+    """DEMO ONLY: mark the caller's payout account ACTIVE (no bank check happens)."""
+    _demo_enabled(request)
+    return _payout_response(await service.simulate_payout_approval(db, user))
+
+
 @router.put("/me/payout-account", response_model=PayoutAccountResponse)
 async def upsert_payout_account(
     payload: PayoutAccountCreate,
@@ -132,7 +170,8 @@ async def get_organizer_analytics(
     """Analytics aggregated across every event the caller may analyze
     (owned, or staff with the ``view_analytics`` permission), optionally
     narrowed to one event and/or ticket type. Every reference is authorized
-    before any aggregate is computed."""
+    before any aggregate is computed. ``sales_over_time`` uses the event
+    timezone when narrowed to one event, otherwise UTC."""
     start, end = analytics_service.validate_range(start, end)
     event_ids, ticket_type = await analytics_service.resolve_scope(
         db,
@@ -140,6 +179,11 @@ async def get_organizer_analytics(
         event_id=event_id,
         ticket_type_id=ticket_type_id,
     )
+    tz_name = "UTC"
+    if len(event_ids) == 1 and (event_id is not None or ticket_type is not None):
+        event = await db.get(Event, event_ids[0])
+        tz_name = event.timezone if event is not None else "UTC"
     return await analytics_service.compute_analytics(
-        db, event_ids=event_ids, ticket_type=ticket_type, start=start, end=end
+        db, event_ids=event_ids, ticket_type=ticket_type, start=start, end=end,
+        tz_name=tz_name,
     )
