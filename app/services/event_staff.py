@@ -11,6 +11,7 @@ from app.db.models import (
     Event,
     EventStaffRole,
     User,
+    UserRole,
     UserStatus,
 )
 from app.schemas.event_staff import EventAdminResponse
@@ -128,19 +129,43 @@ async def remove_event_admin(
     logger.info("user %s removed as Event Admin of event %s by %s", user_id, event.id, actor.id)
 
 
+def can_reverse_check_in(
+    user: User, event: Event, staff_role: EventStaffRole | None
+) -> bool:
+    """Who may reverse a check-in: the event owner, a PLATFORM_ADMIN, or an
+    EVENT_ADMIN of this event. CHECK_IN_STAFF can admit but never reverse.
+
+    This is the single rule used by both ``require_event_reversal_access`` and
+    the ``can_reverse_check_in`` flag on ``GET /events/assigned``.
+    """
+    return (
+        event.owner_user_id == user.id
+        or user.global_role == UserRole.PLATFORM_ADMIN
+        or staff_role == EventStaffRole.EVENT_ADMIN
+    )
+
+
 async def list_assigned_events(
     db: AsyncSession,
     user: User,
     *,
     limit: int,
     offset: int,
-) -> list[Event]:
+) -> list[tuple[Event, bool]]:
+    """Assigned events paired with the caller's ``can_reverse_check_in`` flag."""
     # The ownership/staff filter is applied in SQL so results are paginated and
     # deduplicated by the database.
-    return await repo.list_assigned_events(
+    events = await repo.list_assigned_events(
         db,
         user.id,
         roles=EVENT_CHECKIN_STAFF_ROLES,
         limit=limit,
         offset=offset,
     )
+    roles = await repo.get_staff_roles_for_user(
+        db, user_id=user.id, event_ids=[event.id for event in events]
+    )
+    return [
+        (event, can_reverse_check_in(user, event, roles.get(event.id)))
+        for event in events
+    ]

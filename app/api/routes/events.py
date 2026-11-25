@@ -71,8 +71,9 @@ from app.services.email import EmailProvider
 router = APIRouter(prefix="/events", tags=["events"])
 
 
-def _assigned_response(event: Event) -> AssignedEventResponse:
+def _assigned_response(event: Event, *, can_reverse: bool) -> AssignedEventResponse:
     return AssignedEventResponse(
+        can_reverse_check_in=can_reverse,
         event_id=event.id,
         title=event.title,
         status=event.status.value,
@@ -194,7 +195,7 @@ async def list_assigned_events(
     have an authorized staff assignment.
     """
     events = await staff_service.list_assigned_events(db, user, limit=limit, offset=offset)
-    return [_assigned_response(event) for event in events]
+    return [_assigned_response(event, can_reverse=flag) for event, flag in events]
 
 
 @router.get("/{event_id}/admins", response_model=list[EventAdminResponse])

@@ -20,6 +20,7 @@ from app.db.models import (
 )
 from app.kv.store import TTLStore
 from app.services.email import EmailProvider
+from app.services.event_staff import can_reverse_check_in
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -215,10 +216,8 @@ async def require_event_reversal_access(
     event = await repo.get_event_by_id(db, event_id)
     if event is None:
         raise ApiError(404, "EVENT_NOT_FOUND", "Event not found")
-    if event.owner_user_id == user.id or user.global_role == UserRole.PLATFORM_ADMIN:
-        return event
     staff = await repo.get_event_staff(db, event_id=event_id, user_id=user.id)
-    if staff is not None and staff.role == EventStaffRole.EVENT_ADMIN:
+    if can_reverse_check_in(user, event, staff.role if staff is not None else None):
         return event
     await _deny_event_access(db, user, event)
 
