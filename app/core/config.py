@@ -1,3 +1,4 @@
+import re
 from email.utils import parseaddr
 from functools import lru_cache
 
@@ -78,6 +79,12 @@ class Settings(BaseSettings):
     # the API still returns the token and path but no absolute link/QR image;
     # no production domain is assumed.
     public_web_base_url: str = ""
+    # Where the password reset email links to; the backend appends
+    # ``?token=...&email=...``. Either the web page (https, which mobile apps
+    # can also claim as an App Link / Universal Link) or a custom app scheme
+    # such as ``biletflow://reset-password``. Empty -> ``{PUBLIC_WEB_BASE_URL}
+    # /reset-password``; with neither set the email falls back to the raw token.
+    password_reset_url: str = ""
     order_reservation_ttl_minutes: int = Field(default=10, ge=1, le=1440)
     # Academic MVP demo helpers (organizer verification / payout approval
     # self-service). Set DEMO_SIMULATIONS_ENABLED=false to require a
@@ -165,6 +172,14 @@ class Settings(BaseSettings):
         return base or None
 
     @property
+    def password_reset_link_base(self) -> str | None:
+        explicit = self.password_reset_url.strip()
+        if explicit:
+            return explicit
+        web = self.campaign_link_base
+        return f"{web}/reset-password" if web else None
+
+    @property
     def cors_origin_list(self) -> list[str]:
         return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
 
@@ -193,6 +208,21 @@ class Settings(BaseSettings):
             raise ValueError("PUBLIC_WEB_BASE_URL must be an https:// origin in production")
         if web_base and not web_base.startswith(("https://", "http://")):
             raise ValueError("PUBLIC_WEB_BASE_URL must start with https://")
+
+        reset_url = self.password_reset_url.strip()
+        if reset_url:
+            scheme, sep, rest = reset_url.partition("://")
+            if not sep or not rest or not re.fullmatch(r"[a-z][a-z0-9+.-]*", scheme):
+                raise ValueError(
+                    "PASSWORD_RESET_URL must be an absolute URL such as "
+                    "https://example.com/reset-password or biletflow://reset-password"
+                )
+            if scheme in ("http", "javascript", "data", "file") and (
+                scheme != "http" or self.is_production
+            ):
+                raise ValueError("PASSWORD_RESET_URL must use https:// or an app scheme")
+            if "?" in reset_url or "#" in reset_url:
+                raise ValueError("PASSWORD_RESET_URL must not contain a query or fragment")
 
         provider = self.normalized_email_provider
         if provider not in _EMAIL_PROVIDERS:

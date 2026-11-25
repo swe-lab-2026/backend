@@ -96,7 +96,15 @@ class EmailProvider(Protocol):
     async def send_verification_code(self, *, email: str, code: str, locale: str = "en") -> None:
         ...
 
-    async def send_password_reset(self, *, email: str, token: str, locale: str = "en") -> None:
+    async def send_password_reset(
+        self,
+        *,
+        email: str,
+        token: str,
+        locale: str = "en",
+        link: str | None = None,
+        expires_in_minutes: int | None = None,
+    ) -> None:
         ...
 
     async def send_order_confirmation(self, message: OrderConfirmationEmail) -> None:
@@ -120,6 +128,7 @@ class DevEmailProvider:
     def __init__(self) -> None:
         self._last_codes: dict[str, str] = {}
         self._last_locales: dict[str, str] = {}
+        self._last_reset_links: dict[str, str | None] = {}
         self._last_reset_tokens: dict[str, str] = {}
         self._order_confirmations: list[OrderConfirmationEmail] = []
         self._notifications: list[NotificationEmail] = []
@@ -136,8 +145,17 @@ class DevEmailProvider:
         """Locale of the last verification code or reset email for an address."""
         return self._last_locales.get(email)
 
-    async def send_password_reset(self, *, email: str, token: str, locale: str = "en") -> None:
+    async def send_password_reset(
+        self,
+        *,
+        email: str,
+        token: str,
+        locale: str = "en",
+        link: str | None = None,
+        expires_in_minutes: int | None = None,
+    ) -> None:
         self._last_reset_tokens[email] = token
+        self._last_reset_links[email] = link
         self._last_locales[email] = locale
         # The raw token is deliberately never logged: unlike a short-lived
         # verification code it is a bearer credential, and production logs
@@ -146,6 +164,9 @@ class DevEmailProvider:
 
     def last_reset_token_for(self, email: str) -> str | None:
         return self._last_reset_tokens.get(email)
+
+    def last_reset_link_for(self, email: str) -> str | None:
+        return self._last_reset_links.get(email)
 
     async def send_order_confirmation(self, message: OrderConfirmationEmail) -> None:
         self._order_confirmations.append(message)
@@ -350,10 +371,20 @@ class BrevoEmailProvider:
         )
         await self._post(payload, kind="verification")
 
-    async def send_password_reset(self, *, email: str, token: str, locale: str = "en") -> None:
+    async def send_password_reset(
+        self,
+        *,
+        email: str,
+        token: str,
+        locale: str = "en",
+        link: str | None = None,
+        expires_in_minutes: int | None = None,
+    ) -> None:
         if not token.strip():
             raise PermanentEmailError("Password reset token must not be empty")
-        content = render_password_reset_email(token=token, locale=locale)
+        content = render_password_reset_email(
+            token=token, locale=locale, link=link, expires_in_minutes=expires_in_minutes
+        )
         payload = self._payload(
             to_email=email,
             subject=content.subject,
