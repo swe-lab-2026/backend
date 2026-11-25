@@ -59,7 +59,14 @@ class Settings(BaseSettings):
         "sql/migrate_008_refunds_audit.sql",
         "sql/migrate_009_support_admin_analytics.sql",
         "sql/migrate_010_organizer_refunds.sql",
+        "sql/migrate_011_reports_settings.sql",
     ]
+
+    # --- Uploaded media (event images) ------------------------------------
+    # Files are stored on local disk under MEDIA_ROOT (a Docker volume in
+    # deployment) and served by GET {API_PREFIX}/media/{key}.
+    media_root: str = "media"
+    media_max_upload_bytes: int = Field(default=5 * 1024 * 1024, ge=1024, le=50 * 1024 * 1024)
 
     # --- Tickets / checkout ------------------------------------------------
     # Used to sign QR admission payloads. When empty, the access-token secret

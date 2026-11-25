@@ -10,7 +10,7 @@ from enum import Enum
 from typing import Any, Generic, Literal, TypeVar
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 T = TypeVar("T")
 
@@ -273,3 +273,108 @@ class AdminCampaignResponse(BaseModel):
     starts_at: datetime | None
     ends_at: datetime | None
     created_at: datetime
+
+
+# ---------- Reported events (SRS 4.12) ----------
+
+
+class EventReportReasonValue(str, Enum):
+    FRAUD = "FRAUD"
+    MISLEADING = "MISLEADING"
+    INAPPROPRIATE = "INAPPROPRIATE"
+    PROHIBITED = "PROHIBITED"
+    SPAM = "SPAM"
+    OTHER = "OTHER"
+
+
+class EventReportStatusValue(str, Enum):
+    OPEN = "OPEN"
+    UNDER_REVIEW = "UNDER_REVIEW"
+    RESOLVED = "RESOLVED"
+    DISMISSED = "DISMISSED"
+
+
+class EventReportCreate(BaseModel):
+    reason: EventReportReasonValue
+    details: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("details")
+    @classmethod
+    def _strip(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
+
+    @model_validator(mode="after")
+    def _other_needs_details(self) -> "EventReportCreate":
+        if self.reason == EventReportReasonValue.OTHER and not self.details:
+            raise ValueError("details are required when reason is OTHER")
+        return self
+
+
+class EventReportUpdate(BaseModel):
+    status: EventReportStatusValue
+    resolution_note: str | None = Field(default=None, max_length=2000)
+    # Only with status RESOLVED: also suspend the event (separately audited).
+    suspend_event: bool = False
+
+    @model_validator(mode="after")
+    def _suspend_needs_resolution(self) -> "EventReportUpdate":
+        if self.suspend_event:
+            if self.status != EventReportStatusValue.RESOLVED:
+                raise ValueError("suspend_event is only allowed with status RESOLVED")
+            if not self.resolution_note or len(self.resolution_note.strip()) < 3:
+                raise ValueError("resolution_note (the suspension reason) is required")
+        return self
+
+
+class EventReportResponse(BaseModel):
+    """What the reporter sees about their own report."""
+
+    id: UUID
+    event_id: UUID
+    reason: str
+    details: str | None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    resolved_at: datetime | None
+
+
+class AdminEventReportResponse(EventReportResponse):
+    event: EventRef
+    event_is_suspended: bool
+    # Reports on the same event that are still OPEN or UNDER_REVIEW.
+    event_active_reports: int
+    reporter: PersonRef | None
+    reporter_email: str | None
+    resolution_note: str | None
+    resolved_by_user_id: UUID | None
+
+
+# ---------- Platform settings (SRS 4.12) ----------
+
+
+class PlatformSettingsResponse(BaseModel):
+    activation_fee_amount: Decimal
+    activation_fee_currency: str
+    processing_fee_percent: Decimal
+    updated_at: datetime
+    updated_by_user_id: UUID | None
+
+
+class PlatformSettingsUpdate(BaseModel):
+    activation_fee_amount: Decimal | None = Field(
+        default=None, ge=0, le=Decimal("10000000"), max_digits=12, decimal_places=2
+    )
+    processing_fee_percent: Decimal | None = Field(
+        default=None, ge=0, le=20, max_digits=5, decimal_places=2
+    )
+    reason: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def _something_to_change(self) -> "PlatformSettingsUpdate":
+        if self.activation_fee_amount is None and self.processing_fee_percent is None:
+            raise ValueError("Provide activation_fee_amount and/or processing_fee_percent")
+        return self

@@ -26,6 +26,8 @@ dependencies = [
   "email-validator>=2,<3",
   "reportlab>=4.2,<5",
   "qrcode[pil]>=8,<9",
+  "pillow>=10,<13",
+  "python-multipart>=0.0.9,<1",
 ]
 
 [project.optional-dependencies]
@@ -54,7 +56,10 @@ select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
 
 [tool.ruff.lint.flake8-bugbear]
 # FastAPI's Depends(...) in argument defaults is the framework idiom.
-extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header", "app.api.deps.require_roles"]
+extend-immutable-calls = [
+  "fastapi.Depends", "fastapi.Query", "fastapi.Header", "fastapi.File",
+  "app.api.deps.require_roles",
+]
 
 [tool.mypy]
 python_version = "3.12"

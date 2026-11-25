@@ -425,3 +425,15 @@ class EventPreviewResponse(BaseModel):
     ticket_types: list[TicketTypeResponse]
     publish_ready: bool
     validation_errors: list[str]
+
+
+class EventImageUploadResponse(BaseModel):
+    """A stored upload. Put ``object_key`` into the event's ``images`` list
+    (PATCH /events/{id}) to attach it; it is the image URL."""
+
+    object_key: str
+    url: str
+    content_type: str
+    size_bytes: int
+    width: int
+    height: int

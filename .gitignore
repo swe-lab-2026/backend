@@ -31,3 +31,6 @@ play-*.json
 *.gguf
 ssh-key-2026-11-08.key.pub
 ssh-key-2026-11-08.key
+
+# Uploaded event images (MEDIA_ROOT); a Docker volume in deployment.
+/media/

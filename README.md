@@ -1394,3 +1394,67 @@ Apply with `make migrate` (or on startup).
 * **Migration**: `sql/migrate_010_organizer_refunds.sql` widens
   `refunds_kind_valid` with `ORGANIZER_REQUEST`. `migrate_009` is unchanged
   from PR 19 (already applied in deployments).
+
+## Reported events, platform settings, image upload, calendar, health (SRS 4.12, 4.2, 8)
+
+### Reported events
+
+* `POST /events/{event_id}/reports` (verified user): `{reason, details?}` with
+  `reason` one of `FRAUD`, `MISLEADING`, `INAPPROPRIATE`, `PROHIBITED`, `SPAM`,
+  `OTHER` (`OTHER` requires `details`). Only publicly visible events (404
+  otherwise); owners cannot report their own event (409
+  `CANNOT_REPORT_OWN_EVENT`); one OPEN/UNDER_REVIEW report per user and event
+  (409 `REPORT_ALREADY_OPEN`). The owner is never told who reported.
+* `GET /users/me/reports`: the caller's reports.
+* `GET /admin/reports` (`status`, `reason`, `event_id`, paging),
+  `GET /admin/reports/{id}`: include the event, reporter, whether the event is
+  suspended and `event_active_reports` (open reports on the same event).
+* `PATCH /admin/reports/{id}` `{status, resolution_note?, suspend_event?}`:
+  OPEN ↔ UNDER_REVIEW → RESOLVED | DISMISSED (terminal). `suspend_event: true`
+  is allowed only with `RESOLVED` and uses `resolution_note` as the suspension
+  reason (same effect and audit as `POST /admin/events/{id}/suspend`). The
+  reporter gets an `EVENT_REPORT_REVIEWED` in-app notification.
+
+### Platform settings
+
+* `GET /admin/settings`, `PATCH /admin/settings`
+  `{activation_fee_amount?, processing_fee_percent?, reason?}` (fee ≥ 0,
+  percent 0–20). Audited as `admin.platform_settings_updated` (visible in
+  `GET /admin/actions`). Defaults are the old hard-coded values: 1000.00 KZT
+  and 3%.
+* New orders and promo quotes use the current percent; existing orders keep
+  their stored `fee_amount`. An unpaid activation fee follows the current
+  setting; a paid one is never changed.
+
+### Event image upload
+
+* `POST /events/{event_id}/images/upload` (owner or Platform Admin), multipart
+  field `file`: JPEG, PNG or WebP, at most `MEDIA_MAX_UPLOAD_BYTES` (5 MB).
+  The image is decoded and re-encoded (metadata such as GPS is removed); other
+  files get 415, larger ones 413. The response `object_key` is the image URL:
+  put it in `images` on `PATCH /events/{id}` to attach it (same contract as
+  before, external URLs still work).
+* `GET /media/{key}` serves stored files (public, immutable cache headers).
+  Files live under `MEDIA_ROOT` (`media/` locally, the `media_data` volume in
+  Docker). The URL is `{PUBLIC_BASE_URL}/api/v1/media/...`; with
+  `PUBLIC_BASE_URL` empty it is relative, which works through the web app's
+  `/api/v1` proxy but not for the mobile app.
+
+### Calendar export
+
+* `GET /events/{event_id}/calendar.ics`: RFC 5545 file, same visibility as
+  `GET /events/{id}`. `URL` points to `{PUBLIC_WEB_BASE_URL}/catalog/{id}` when
+  that is set; cancelled events have `STATUS:CANCELLED`.
+
+### Health checks
+
+* `GET /health/live`: the process is up.
+* `GET /health/ready`: `SELECT 1` on PostgreSQL and `PING` on Redis (when
+  configured); 503 with `checks` when one fails. Used by the Docker healthcheck.
+
+### Migration
+
+`sql/migrate_011_reports_settings.sql` adds `event_reports` and
+`platform_settings` (seeded with id 1). Additive; apply with `make migrate` or
+on startup. New dependencies: `python-multipart`, `pillow` (already installed
+through `qrcode[pil]`).

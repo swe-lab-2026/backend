@@ -23,6 +23,7 @@ from app.db.models import (
     PaymentStatus,
     PayoutAccount,
     PayoutStatus,
+    PlatformSettings,
     RefundStatus,
     SupportCaseStatus,
     SupportCaseType,
@@ -36,6 +37,7 @@ from app.schemas.admin import (
     AdminActivationResponse,
     AdminCampaignResponse,
     AdminEventActionResponse,
+    AdminEventReportResponse,
     AdminEventResponse,
     AdminOrderResponse,
     AdminPaymentResponse,
@@ -46,16 +48,23 @@ from app.schemas.admin import (
     DisputeResponse,
     DisputeStatusValue,
     DisputeUpdate,
+    EventReportReasonValue,
+    EventReportStatusValue,
+    EventReportUpdate,
     FailureKind,
     OperationalFailureResponse,
     OrganizerVerificationUpdate,
     Page,
     PayoutStatusUpdate,
+    PlatformSettingsResponse,
+    PlatformSettingsUpdate,
 )
 from app.schemas.organizers import OrganizerProfileResponse, PayoutAccountResponse
 from app.schemas.support import SupportCasePage, SupportCaseStatusValue
 from app.services import admin as service
 from app.services import organizers as organizer_service
+from app.services import platform_settings
+from app.services import reports as report_service
 from app.services import support as support_service
 
 require_admin = require_roles("PLATFORM_ADMIN")
@@ -448,3 +457,76 @@ async def set_payout_account_status(
         reason=payload.reason,
     )
     return _payout_response(account)
+
+
+# ---------- Reported events (SRS 4.12) ----------
+
+
+@router.get("/reports", response_model=Page[AdminEventReportResponse])
+async def list_event_reports(
+    status: EventReportStatusValue | None = None,
+    reason: EventReportReasonValue | None = None,
+    event_id: UUID | None = None,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+) -> Page[AdminEventReportResponse]:
+    return await report_service.list_reports(
+        db, status=status.value if status else None, reason=reason.value if reason else None,
+        event_id=event_id, limit=limit, offset=offset,
+    )
+
+
+@router.get("/reports/{report_id}", response_model=AdminEventReportResponse)
+async def get_event_report(
+    report_id: UUID, db: AsyncSession = Depends(get_db)
+) -> AdminEventReportResponse:
+    return await report_service.get_report(db, report_id)
+
+
+@router.patch("/reports/{report_id}", response_model=AdminEventReportResponse)
+async def update_event_report(
+    report_id: UUID,
+    payload: EventReportUpdate,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> AdminEventReportResponse:
+    """Review a report. ``suspend_event`` (with RESOLVED) also suspends the event,
+    using ``resolution_note`` as the suspension reason."""
+    return await report_service.update_report(
+        db, admin, report_id, status=payload.status.value, note=payload.resolution_note,
+        suspend_event=payload.suspend_event,
+    )
+
+
+# ---------- Platform settings (SRS 4.12) ----------
+
+
+def _settings_response(row: PlatformSettings) -> PlatformSettingsResponse:
+    return PlatformSettingsResponse(
+        activation_fee_amount=row.activation_fee_amount,
+        activation_fee_currency=row.activation_fee_currency,
+        processing_fee_percent=row.processing_fee_percent,
+        updated_at=row.updated_at,
+        updated_by_user_id=row.updated_by_user_id,
+    )
+
+
+@router.get("/settings", response_model=PlatformSettingsResponse)
+async def get_platform_settings(db: AsyncSession = Depends(get_db)) -> PlatformSettingsResponse:
+    return _settings_response(await platform_settings.get_settings_row(db))
+
+
+@router.patch("/settings", response_model=PlatformSettingsResponse)
+async def update_platform_settings(
+    payload: PlatformSettingsUpdate,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> PlatformSettingsResponse:
+    """Change the activation fee and/or processing fee. Only new charges use the
+    new values: paid activation fees and existing orders keep theirs."""
+    row = await platform_settings.update_settings(
+        db, admin, activation_fee_amount=payload.activation_fee_amount,
+        processing_fee_percent=payload.processing_fee_percent, reason=payload.reason,
+    )
+    return _settings_response(row)

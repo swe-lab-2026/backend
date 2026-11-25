@@ -1,8 +1,8 @@
 from datetime import date, datetime
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, File, Query, Response, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
@@ -14,10 +14,13 @@ from app.api.deps import (
     require_active_user,
     require_event_analytics_access,
     require_event_owner,
+    require_verified_user,
 )
 from app.core.config import Settings
+from app.core.errors import ApiError
 from app.db import repositories as repo
 from app.db.models import Event, EventImage, EventSalesActivation, TicketType, User
+from app.schemas.admin import EventReportCreate, EventReportResponse
 from app.schemas.analytics import AnalyticsResponse, TimelinePage
 from app.schemas.event_staff import (
     AssignedEventResponse,
@@ -27,6 +30,7 @@ from app.schemas.event_staff import (
 from app.schemas.events import (
     EventCreate,
     EventImageResponse,
+    EventImageUploadResponse,
     EventInventoryResponse,
     EventPreviewResponse,
     EventResponse,
@@ -53,11 +57,14 @@ from app.schemas.refunds import (
     RefundPolicyUpdate,
 )
 from app.services import analytics as analytics_service
+from app.services import calendar as calendar_service
 from app.services import event_staff as staff_service
 from app.services import events as service
 from app.services import inventory as inventory_service
+from app.services import media as media_service
 from app.services import notifications, paid_sales, refunds
 from app.services import orders as order_service
+from app.services import reports as report_service
 from app.services import ticket_types as ticket_type_service
 from app.services.email import EmailProvider
 
@@ -683,4 +690,89 @@ async def get_event_timeline(
     return await analytics_service.event_timeline(
         db, event, actions=action, entity_types=entity_type, start=start, end=end,
         order=order, limit=limit, offset=offset,
+    )
+
+
+# ---------- Event images (upload) ----------
+
+_UPLOAD_CHUNK = 64 * 1024
+
+
+@router.post(
+    "/{event_id}/images/upload", response_model=EventImageUploadResponse, status_code=201
+)
+async def upload_event_image(
+    event_id: UUID,
+    file: Annotated[UploadFile, File()],
+    event: Event = Depends(require_event_owner),
+    actor: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+) -> EventImageUploadResponse:
+    """Store a JPEG, PNG or WebP image (multipart field ``file``).
+
+    The image is re-encoded (metadata removed). The returned ``object_key`` is
+    its URL; send it in ``images`` on PATCH /events/{id} to attach it.
+    """
+    limit = settings.media_max_upload_bytes
+    data = bytearray()
+    while chunk := await file.read(_UPLOAD_CHUNK):
+        data.extend(chunk)
+        if len(data) > limit:
+            raise ApiError(
+                413, "UPLOAD_TOO_LARGE", f"Images must be at most {limit // (1024 * 1024)} MB"
+            )
+    stored = await media_service.save_event_image(settings.media_root, event.id, bytes(data))
+    url = f"{settings.public_api_base}/media/{stored.key}"
+    await repo.add_audit_entry(
+        db, actor_user_id=actor.id, entity_type="event", entity_id=event.id, event_id=event.id,
+        action="event.image_uploaded",
+        after_data={"key": stored.key, "size_bytes": stored.size_bytes},
+    )
+    return EventImageUploadResponse(
+        object_key=url, url=url, content_type=stored.content_type,
+        size_bytes=stored.size_bytes, width=stored.width, height=stored.height,
+    )
+
+
+# ---------- Calendar export ----------
+
+
+@router.get(
+    "/{event_id}/calendar.ics",
+    response_class=Response,
+    responses={200: {"content": {"text/calendar": {}}}},
+)
+async def export_event_calendar(
+    event_id: UUID,
+    user: User | None = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+) -> Response:
+    """iCalendar (.ics) file for one event; same visibility as GET /events/{id}."""
+    event = await service.get_visible_event(db, event_id, user)
+    base = settings.campaign_link_base
+    body = calendar_service.build_event_ics(
+        event, url=f"{base}/catalog/{event.id}" if base else None
+    )
+    return Response(
+        content=body,
+        media_type="text/calendar; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="event-{event.id}.ics"'},
+    )
+
+
+# ---------- Reporting an event (SRS 4.12) ----------
+
+
+@router.post("/{event_id}/reports", response_model=EventReportResponse, status_code=201)
+async def report_event(
+    event_id: UUID,
+    payload: EventReportCreate,
+    user: User = Depends(require_verified_user),
+    db: AsyncSession = Depends(get_db),
+) -> EventReportResponse:
+    """Report a public event to the platform. One open report per user and event."""
+    return await report_service.create_report(
+        db, user, event_id, reason=payload.reason.value, details=payload.details
     )
