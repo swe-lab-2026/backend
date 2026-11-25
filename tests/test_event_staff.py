@@ -375,7 +375,10 @@ async def test_owner_sees_owned_events_without_staff_assignment(client, app, db)
         "venue_name",
         "city",
         "timezone",
+        "can_reverse_check_in",
     }
+    # Owners may reverse check-ins on their own events.
+    assert all(item["can_reverse_check_in"] is True for item in body)
 
     rows = (
         await db.execute(select(EventStaff).where(EventStaff.user_id == owner.id))

@@ -934,6 +934,21 @@ async def list_event_staff(
     return [(row[0], row[1]) for row in result.all()]
 
 
+async def get_staff_roles_for_user(
+    session: AsyncSession, *, user_id: UUID, event_ids: list[UUID]
+) -> dict[UUID, EventStaffRole]:
+    """The caller's staff role per event (event_staff has one row per event/user)."""
+    if not event_ids:
+        return {}
+    result = await session.execute(
+        select(EventStaff.event_id, EventStaff.role).where(
+            EventStaff.user_id == user_id,
+            EventStaff.event_id.in_(event_ids),
+        )
+    )
+    return {event_id: role for event_id, role in result.all()}
+
+
 async def list_assigned_events(
     session: AsyncSession,
     user_id: UUID,

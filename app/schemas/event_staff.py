@@ -29,3 +29,6 @@ class AssignedEventResponse(BaseModel):
     venue_name: str | None
     city: str | None
     timezone: str
+    # Caller-specific: whether this user may reverse check-ins for the event
+    # (same rule as POST .../reverse-check-in, which still enforces it).
+    can_reverse_check_in: bool

@@ -465,6 +465,60 @@ async def test_reversal_is_limited_to_owner_platform_admin_and_event_admin(
     assert admin_reverse.status_code == 200
 
 
+async def test_assigned_events_report_caller_specific_reversal_permission(
+    client, app, db
+):
+    """GET /events/assigned exposes can_reverse_check_in using the same rule as
+    the reversal endpoint, and the endpoint keeps enforcing it."""
+    event_id, ticket_type_id, _owner, owner_token, _buyer, buyer_token = (
+        await _setup_event(client, app, db)
+    )
+    event_admin = await create_user(db, email="flag-event-admin@example.com")
+    checkin_staff = await create_user(db, email="flag-checkin-staff@example.com")
+    await _assign_staff(
+        db, event_id=event_id, user_id=event_admin.id, role=EventStaffRole.EVENT_ADMIN
+    )
+    await _assign_staff(
+        db,
+        event_id=event_id,
+        user_id=checkin_staff.id,
+        role=EventStaffRole.CHECK_IN_STAFF,
+    )
+    admin_token = access_token_for(app, event_admin)
+    staff_token = access_token_for(app, checkin_staff)
+
+    async def flag(token: str) -> bool:
+        response = await client.get(f"{API}/events/assigned", headers=bearer(token))
+        assert response.status_code == 200, response.text
+        rows = {row["event_id"]: row for row in response.json()}
+        assert event_id in rows
+        return rows[event_id]["can_reverse_check_in"]
+
+    assert await flag(owner_token) is True
+    assert await flag(admin_token) is True
+    assert await flag(staff_token) is False
+
+    order = await _buy(client, buyer_token, event_id, ticket_type_id)
+    ticket = order["tickets"][0]
+    reverse_url = f"{API}/events/{event_id}/tickets/{ticket['public_id']}/reverse-check-in"
+
+    # Check-in staff can admit but is refused by the server when reversing,
+    # regardless of what the UI shows.
+    admit = await client.post(
+        f"{API}/events/{event_id}/tickets/{ticket['public_id']}/check-in",
+        headers=bearer(staff_token),
+    )
+    assert admit.status_code == 200, admit.text
+    denied = await client.post(reverse_url, headers=bearer(staff_token))
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "INSUFFICIENT_EVENT_PERMISSIONS"
+
+    # The assigned Event Admin is allowed and the ticket returns to VALID.
+    reversed_ = await client.post(reverse_url, headers=bearer(admin_token))
+    assert reversed_.status_code == 200, reversed_.text
+    assert reversed_.json()["status"] == "VALID"
+
+
 async def test_campaign_qr_is_never_accepted_as_admission(client, app, db):
     event_id, _ticket_type_id, _owner, owner_token, _buyer, _buyer_token = (
         await _setup_event(client, app, db)
