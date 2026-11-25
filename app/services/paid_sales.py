@@ -22,9 +22,10 @@ from app.db.models import (
     User,
     VerificationStatus,
 )
-from app.services import notifications
+from app.services import notifications, platform_settings
 from app.services import orders as order_service
 
+# Defaults only; the live values come from platform settings (SRS 4.12).
 ACTIVATION_FEE_KZT = Decimal("1000.00")
 PROCESSING_FEE_RATE = Decimal("0.03")
 SIMULATION_PROVIDER = "internal_simulation"
@@ -35,10 +36,19 @@ def now_utc() -> datetime:
 
 
 async def get_or_create_activation(db: AsyncSession, event: Event) -> EventSalesActivation:
+    """Load the activation row; an unpaid fee follows the current platform fee.
+
+    Once the fee is paid the amount is a fixed record and never changes.
+    """
+    fee = await platform_settings.activation_fee_amount(db)
     row = await db.get(EventSalesActivation, event.id)
     if row is None:
-        row = EventSalesActivation(event_id=event.id, activation_fee_amount=ACTIVATION_FEE_KZT)
+        row = EventSalesActivation(event_id=event.id, activation_fee_amount=fee)
         db.add(row)
+        await db.flush()
+    elif row.activation_fee_paid_at is None and row.activation_fee_amount != fee:
+        row.activation_fee_amount = fee
+        row.updated_at = now_utc()
         await db.flush()
     return row
 

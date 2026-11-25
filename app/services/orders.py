@@ -29,7 +29,7 @@ from app.schemas.campaigns import PricedLineResponse, PromoQuoteResponse, PromoV
 from app.schemas.orders import OrderCreate, OrderItemResponse, OrderResponse
 from app.schemas.tickets import TicketResponse
 from app.services import campaigns as campaign_service
-from app.services import notifications
+from app.services import notifications, platform_settings
 from app.services import tickets as ticket_service
 from app.services.events import as_utc, ensure_not_suspended
 
@@ -37,14 +37,15 @@ logger = logging.getLogger("app.orders")
 
 DEFAULT_RESERVATION_TTL_MINUTES = 10
 _COMMITTED_STATUSES = {OrderStatus.PAID, OrderStatus.CONFIRMED}
+# Default rate; the live value comes from platform settings (SRS 4.12).
 PROCESSING_FEE_RATE = Decimal("0.03")
 
 
-def calculate_processing_fee(payable: Decimal) -> Decimal:
-    """3% processing fee on the discounted amount, rounded to tiyn."""
+def calculate_processing_fee(payable: Decimal, rate: Decimal = PROCESSING_FEE_RATE) -> Decimal:
+    """Processing fee (``rate``, 3% by default) on the discounted amount, rounded to tiyn."""
     if payable <= 0:
         return Decimal("0.00")
-    return (payable * PROCESSING_FEE_RATE).quantize(Decimal("0.01"))
+    return (payable * rate).quantize(Decimal("0.01"))
 
 
 def _now() -> datetime:
@@ -282,7 +283,9 @@ async def create_order(
     payable = subtotal - discount_total
     is_free = payable == Decimal("0.00")
     # Processing fee is calculated by the backend on the discounted amount.
-    processing_fee = calculate_processing_fee(payable)
+    processing_fee = calculate_processing_fee(
+        payable, await platform_settings.processing_fee_rate(db)
+    )
     expires_at = (
         None
         if is_free
@@ -697,7 +700,7 @@ async def quote_promotion(db: AsyncSession, payload: PromoValidateRequest) -> Pr
         currency=currency,
     )
     payable = subtotal - discount.total
-    fee = calculate_processing_fee(payable)
+    fee = calculate_processing_fee(payable, await platform_settings.processing_fee_rate(db))
     return PromoQuoteResponse(
         campaign_id=campaign.id,
         code=campaign.promo_code,

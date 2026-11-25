@@ -4,9 +4,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 
 import redis.asyncio as redis_async
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.routes import (
@@ -14,6 +16,7 @@ from app.api.routes import (
     auth,
     campaigns,
     events,
+    media,
     orders,
     organizers,
     support,
@@ -147,7 +150,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         CORSMiddleware,
         allow_origins=settings.cors_origin_list or ["*"],
         allow_credentials=False,
-        allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
         expose_headers=["X-Request-ID"],
     )
@@ -163,10 +166,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(tickets.router, prefix=settings.api_prefix)
     app.include_router(tickets.checkin_router, prefix=settings.api_prefix)
     app.include_router(support.router, prefix=settings.api_prefix)
+    app.include_router(media.router, prefix=settings.api_prefix)
 
     @app.get("/")
     async def root() -> dict[str, str]:
         return {"service": settings.app_name, "status": "ok"}
+
+    @app.get("/health/live", tags=["health"])
+    async def health_live() -> dict[str, str]:
+        """The process is up and serving requests."""
+        return {"status": "ok"}
+
+    @app.get("/health/ready", tags=["health"])
+    async def health_ready(request: Request) -> JSONResponse:
+        """PostgreSQL (and Redis, when configured) answer; 503 otherwise."""
+        checks: dict[str, str] = {}
+        try:
+            async with request.app.state.engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            checks["database"] = "ok"
+        except Exception:
+            logger.warning("readiness check: database unavailable", exc_info=True)
+            checks["database"] = "unavailable"
+        redis = request.app.state.redis
+        if redis is not None:
+            try:
+                await redis.ping()
+                checks["redis"] = "ok"
+            except Exception:
+                logger.warning("readiness check: redis unavailable", exc_info=True)
+                checks["redis"] = "unavailable"
+        ready = all(value == "ok" for value in checks.values())
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={"status": "ok" if ready else "unavailable", "checks": checks},
+        )
 
     return app
 

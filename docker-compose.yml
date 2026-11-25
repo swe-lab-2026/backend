@@ -38,9 +38,18 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://swedb:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/swedb
       REDIS_URL: redis://redis:6379/0
+      MEDIA_ROOT: /app/media
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       - "127.0.0.1:8000:8000"
+    volumes:
+      - media_data:/app/media
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     depends_on:
       postgres:
         condition: service_healthy
@@ -54,3 +63,4 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  media_data:

@@ -1302,6 +1302,106 @@ class PaymentDispute(Base):
     )
 
 
+class EventReportReason(PyEnum):
+    FRAUD = "FRAUD"
+    MISLEADING = "MISLEADING"
+    INAPPROPRIATE = "INAPPROPRIATE"
+    PROHIBITED = "PROHIBITED"
+    SPAM = "SPAM"
+    OTHER = "OTHER"
+
+
+class EventReportStatus(PyEnum):
+    OPEN = "OPEN"
+    UNDER_REVIEW = "UNDER_REVIEW"
+    RESOLVED = "RESOLVED"
+    DISMISSED = "DISMISSED"
+
+
+class EventReport(Base):
+    """A user's report about an event, reviewed by Platform Admins (SRS 4.12).
+
+    Resolving a report never changes the event by itself; suspension is an
+    explicit, separately audited admin action (optionally triggered together).
+    """
+
+    __tablename__ = "event_reports"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("events.id", ondelete="CASCADE"), nullable=False
+    )
+    reporter_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    reason: Mapped[str] = mapped_column(String(30), nullable=False)
+    details: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=EventReportStatus.OPEN.value
+    )
+    resolution_note: Mapped[str | None] = mapped_column(Text)
+    resolved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(TimestampTz)
+    created_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
+
+    __table_args__ = (
+        CheckConstraint(
+            "reason IN ('FRAUD', 'MISLEADING', 'INAPPROPRIATE', 'PROHIBITED', 'SPAM', 'OTHER')",
+            name="event_reports_reason_valid",
+        ),
+        CheckConstraint(
+            "status IN ('OPEN', 'UNDER_REVIEW', 'RESOLVED', 'DISMISSED')",
+            name="event_reports_status_valid",
+        ),
+        # One active report per reporter and event.
+        Index(
+            "uq_event_reports_active",
+            "event_id",
+            "reporter_user_id",
+            unique=True,
+            postgresql_where=text("status IN ('OPEN', 'UNDER_REVIEW')"),
+            sqlite_where=text("status IN ('OPEN', 'UNDER_REVIEW')"),
+        ),
+        Index("idx_event_reports_status", "status", text("created_at DESC")),
+        Index("idx_event_reports_event", "event_id", text("created_at DESC")),
+    )
+
+
+class PlatformSettings(Base):
+    """Single-row table with platform-wide commercial settings (SRS 4.12).
+
+    ``id`` is always 1. Changes are audited; amounts already charged or
+    snapshotted (paid activation fees, order fees) are never rewritten.
+    """
+
+    __tablename__ = "platform_settings"
+
+    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, default=1)
+    activation_fee_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), nullable=False, default=Decimal("1000.00")
+    )
+    activation_fee_currency: Mapped[str] = mapped_column(CHAR(3), nullable=False, default="KZT")
+    processing_fee_percent: Mapped[Decimal] = mapped_column(
+        Numeric(5, 2), nullable=False, default=Decimal("3.00")
+    )
+    updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    updated_at: Mapped[datetime] = mapped_column(TimestampTz, nullable=False, default=_utcnow)
+
+    __table_args__ = (
+        CheckConstraint("id = 1", name="platform_settings_singleton"),
+        CheckConstraint("activation_fee_amount >= 0", name="platform_settings_fee_nonnegative"),
+        CheckConstraint(
+            "processing_fee_percent >= 0 AND processing_fee_percent <= 20",
+            name="platform_settings_percent_range",
+        ),
+    )
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 

@@ -6,9 +6,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user, get_db
 from app.core.errors import ApiError
 from app.db.models import Notification, User
+from app.schemas.admin import EventReportResponse, Page
 from app.schemas.support import NotificationPage, NotificationResponse
 from app.schemas.users import UpdateUserRequest, UserResponse
 from app.services import notifications
+from app.services import reports as report_service
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -87,3 +89,14 @@ async def mark_my_notification_read(
     if row is None:
         raise ApiError(404, "NOTIFICATION_NOT_FOUND", "Notification not found")
     return _notification_response(row)
+
+
+@router.get("/me/reports", response_model=Page[EventReportResponse])
+async def list_my_reports(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Page[EventReportResponse]:
+    """Event reports the caller has submitted, newest first."""
+    return await report_service.list_my_reports(db, user, limit=limit, offset=offset)
