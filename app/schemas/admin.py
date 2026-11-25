@@ -7,7 +7,7 @@ payment credentials (the platform stores none; payments are simulated).
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
@@ -34,8 +34,20 @@ class AdminReasonRequest(BaseModel):
         return cleaned
 
 
+class PersonRef(BaseModel):
+    id: UUID
+    name: str
+
+
+class EventRef(BaseModel):
+    id: UUID
+    title: str
+
+
 class AdminUserResponse(BaseModel):
+    id: UUID
     user_id: UUID
+    name: str
     email: str
     first_name: str
     last_name: str
@@ -55,6 +67,7 @@ class AdminUserResponse(BaseModel):
 class AdminEventResponse(BaseModel):
     id: UUID
     title: str
+    owner: PersonRef | None
     owner_user_id: UUID
     owner_email: str | None
     organizer_display_name: str | None
@@ -84,6 +97,7 @@ class AdminEventActionResponse(BaseModel):
 class AdminOrderResponse(BaseModel):
     id: UUID
     order_number: int
+    event: EventRef | None
     event_id: UUID
     event_title: str | None
     buyer_user_id: UUID | None
@@ -120,7 +134,17 @@ class AdminPaymentResponse(BaseModel):
     updated_at: datetime
 
 
+class ActivationChecklist(BaseModel):
+    verification_complete: bool
+    payout_account_complete: bool
+    activation_fee_paid: bool
+    terms_accepted: bool
+
+
 class AdminActivationResponse(BaseModel):
+    event: EventRef | None
+    organizer: PersonRef | None
+    checklist: ActivationChecklist
     event_id: UUID
     event_title: str | None
     owner_user_id: UUID | None
@@ -142,6 +166,7 @@ class AdminRefundResponse(BaseModel):
     id: UUID
     order_id: UUID
     order_number: int | None
+    event: EventRef | None
     event_id: UUID | None
     payment_id: UUID
     amount: Decimal
@@ -222,3 +247,29 @@ class AdminActionResponse(BaseModel):
     reason: str | None
     before: dict[str, Any] | None
     after: dict[str, Any] | None
+
+
+class OrganizerVerificationUpdate(BaseModel):
+    status: Literal["PENDING", "VERIFIED", "REJECTED"]
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+class PayoutStatusUpdate(BaseModel):
+    status: Literal["PENDING", "ACTIVE", "BLOCKED"]
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+class AdminCampaignResponse(BaseModel):
+    id: UUID
+    event: EventRef | None
+    name: str
+    code: str | None
+    status: str
+    effective_status: str
+    discount_type: str
+    discount_value: Decimal
+    redemption_count: int
+    redemption_limit: int | None
+    starts_at: datetime | None
+    ends_at: datetime | None
+    created_at: datetime

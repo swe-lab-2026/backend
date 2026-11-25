@@ -18,12 +18,14 @@ Time basis (see ``DEFINITIONS``):
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import Date, and_, case, func, or_, select
+from sqlalchemy import cast as sql_cast
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -43,9 +45,12 @@ from app.db.models import (
     Order,
     OrderItem,
     OrderStatus,
+    Payment,
+    PaymentDispute,
     PromoRedemption,
     Refund,
     RefundStatus,
+    SupportCase,
     Ticket,
     TicketStatus,
     TicketType,
@@ -62,6 +67,7 @@ from app.schemas.analytics import (
     CurrencySales,
     EventHistoryItem,
     EventHistoryPage,
+    SalesOverTimePoint,
     TicketTypeMetrics,
     TimelineActor,
     TimelineEntry,
@@ -256,6 +262,31 @@ class _TypeAcc:
     period_revenue: Decimal = ZERO
 
 
+def resolve_dates(
+    date_from: date | None, date_to: date | None, tz_name: str
+) -> tuple[datetime | None, datetime | None]:
+    """Inclusive calendar dates in ``tz_name`` -> UTC [start, end) bounds."""
+    if date_from is not None and date_to is not None and date_to < date_from:
+        raise ApiError(422, "INVALID_DATE_RANGE", "to must not be before from")
+    tz = zone(tz_name)
+    start = (
+        datetime.combine(date_from, time.min, tzinfo=tz).astimezone(timezone.utc)
+        if date_from is not None else None
+    )
+    end = (
+        datetime.combine(date_to + timedelta(days=1), time.min, tzinfo=tz).astimezone(timezone.utc)
+        if date_to is not None else None
+    )
+    return start, end
+
+
+def zone(tz_name: str) -> tzinfo:
+    try:
+        return ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return timezone.utc
+
+
 async def compute_analytics(
     db: AsyncSession,
     *,
@@ -263,6 +294,7 @@ async def compute_analytics(
     ticket_type: TicketType | None,
     start: datetime | None,
     end: datetime | None,
+    tz_name: str = "UTC",
 ) -> AnalyticsResponse:
     now = _now()
     tt_id = ticket_type.id if ticket_type is not None else None
@@ -272,6 +304,7 @@ async def compute_analytics(
         ticket_type_id=tt_id,
         start=start,
         end=end,
+        timezone=tz_name,
         generated_at=now,
     )
     if not event_ids:
@@ -583,11 +616,82 @@ async def compute_analytics(
             period_admitted_tickets=admitted,
         ),
         sales=sales,
+        sales_over_time=[
+            point for _currency, point in await _sales_over_time(
+                db, event_ids=event_ids, tt_id=tt_id, start=start, end=end, tz_name=tz_name
+            )
+        ],
         ticket_types=type_metrics,
         campaigns=await _campaign_metrics(
             db, event_ids=event_ids, tt_id=tt_id, start=start, end=end
         ),
     )
+
+
+async def _sales_over_time(
+    db: AsyncSession,
+    *,
+    event_ids: list[UUID],
+    tt_id: UUID | None,
+    start: datetime | None,
+    end: datetime | None,
+    tz_name: str,
+) -> list[tuple[str, SalesOverTimePoint]]:
+    """Daily (currency, point) rows by orders.paid_at in ``tz_name``.
+
+    PostgreSQL buckets in SQL with ``timezone()``; the SQLite test fallback
+    has no time zone support, so per-order rows are bucketed in Python.
+    """
+    conditions: list[Any] = [
+        Order.event_id.in_(event_ids),
+        Order.paid_at.is_not(None),
+        *_in_range(Order.paid_at, start, end),
+    ]
+    if tt_id is not None:
+        conditions.append(OrderItem.ticket_type_id == tt_id)
+    buckets: dict[tuple[str, date], list[Any]] = {}
+    if db.bind.dialect.name == "postgresql":
+        day = sql_cast(func.timezone(tz_name, Order.paid_at), Date)
+        rows = (
+            await db.execute(
+                select(
+                    Order.currency, day, func.count(func.distinct(Order.id)),
+                    func.count(OrderItem.id), func.coalesce(func.sum(OrderItem.unit_price), 0),
+                )
+                .join(Order, Order.id == OrderItem.order_id)
+                .where(*conditions)
+                .group_by(Order.currency, day)
+            )
+        ).all()
+        for currency, bucket, orders, tickets, gross in rows:
+            buckets[(currency, bucket)] = [int(orders), int(tickets), _money(gross)]
+    else:
+        tz = zone(tz_name)
+        order_rows = (
+            await db.execute(
+                select(
+                    Order.id, Order.currency, Order.paid_at,
+                    func.count(OrderItem.id), func.coalesce(func.sum(OrderItem.unit_price), 0),
+                )
+                .join(Order, Order.id == OrderItem.order_id)
+                .where(*conditions)
+                .group_by(Order.id, Order.currency, Order.paid_at)
+            )
+        ).all()
+        for _order_id, currency, paid_at, tickets, gross in order_rows:
+            assert paid_at is not None
+            aware = paid_at if paid_at.tzinfo else paid_at.replace(tzinfo=timezone.utc)
+            key = (currency, aware.astimezone(tz).date())
+            acc = buckets.setdefault(key, [0, 0, ZERO])
+            acc[0] += 1
+            acc[1] += int(tickets)
+            acc[2] += _money(gross)
+    return [
+        (currency, SalesOverTimePoint(
+            date=day_, currency=currency, orders=v[0], tickets=v[1], gross=v[2]
+        ))
+        for (currency, day_), v in sorted(buckets.items(), key=lambda kv: (kv[0][1], kv[0][0]))
+    ]
 
 
 async def _campaign_metrics(
@@ -854,6 +958,7 @@ _DESCRIPTIONS = {
     "event.published": "Event published",
     "event.unpublished": "Event unpublished",
     "event.cancelled": "Event cancelled",
+    "event.completed": "Event completed",
     "event.duplicated": "Event created as a copy of another event",
     "event.deleted": "Draft event deleted",
     "event.refund_policy_updated": "Refund policy updated",
@@ -954,6 +1059,7 @@ async def event_timeline(
             .offset(offset)
         )
     ).all()
+    labels = await entity_labels(db, [row[0] for row in rows])
     items = [
         TimelineEntry(
             id=entry.id,
@@ -961,6 +1067,9 @@ async def event_timeline(
             action=entry.action,
             entity_type=entry.entity_type,
             entity_id=entry.entity_id,
+            entity_label=(
+                labels.get((entry.entity_type, entry.entity_id)) if entry.entity_id else None
+            ),
             actor=TimelineActor(
                 user_id=entry.actor_user_id,
                 type=entry.actor_type,
@@ -977,3 +1086,95 @@ async def event_timeline(
 
 def is_platform_admin(user: User) -> bool:
     return user.global_role == UserRole.PLATFORM_ADMIN
+
+
+# ---------- Entity labels (audit log / timeline) ----------
+
+async def entity_labels(db: AsyncSession, entries: list[AuditLog]) -> dict[tuple[str, UUID], str]:
+    """Human-readable labels for the entities on one page of audit entries.
+
+    One query per entity type present (bounded by the page), no per-row loads.
+    """
+    wanted: dict[str, set[UUID]] = defaultdict(set)
+    for entry in entries:
+        if entry.entity_id is not None:
+            wanted[entry.entity_type].add(entry.entity_id)
+    labels: dict[tuple[str, UUID], str] = {}
+
+    async def collect(kind: str, stmt: Any, fmt: Any) -> None:
+        if not wanted.get(kind):
+            return
+        for row in (await db.execute(stmt)).all():
+            labels[(kind, row[0])] = fmt(*row[1:])
+
+    def order_label(prefix: str) -> Any:
+        return lambda number: f"{prefix}order #{number}" if prefix else f"Order #{number}"
+
+    await collect("event", select(Event.id, Event.title).where(
+        Event.id.in_(wanted["event"])), lambda title: title)
+    await collect("ticket_type", select(TicketType.id, TicketType.name).where(
+        TicketType.id.in_(wanted["ticket_type"])), lambda name: name)
+    await collect("campaign", select(Campaign.id, Campaign.name).where(
+        Campaign.id.in_(wanted["campaign"])), lambda name: name)
+    await collect("support_case", select(SupportCase.id, SupportCase.subject).where(
+        SupportCase.id.in_(wanted["support_case"])), lambda subject: subject)
+    await collect("order", select(Order.id, Order.order_number).where(
+        Order.id.in_(wanted["order"])), order_label(""))
+    await collect("payment", select(Payment.id, Order.order_number).join(
+        Order, Order.id == Payment.order_id).where(Payment.id.in_(wanted["payment"])),
+        order_label("Payment for "))
+    await collect("refund", select(Refund.id, Order.order_number).join(
+        Order, Order.id == Refund.order_id).where(Refund.id.in_(wanted["refund"])),
+        order_label("Refund for "))
+    await collect("payment_dispute", select(PaymentDispute.id, Order.order_number).join(
+        Order, Order.id == PaymentDispute.order_id).where(
+        PaymentDispute.id.in_(wanted["payment_dispute"])), order_label("Dispute on "))
+    await collect("ticket", select(Ticket.id, OrderItem.ticket_type_name).join(
+        OrderItem, OrderItem.id == Ticket.order_item_id).where(Ticket.id.in_(wanted["ticket"])),
+        lambda name: f"{name} ticket")
+    for kind in ("user", "event_staff", "organizer_profile"):
+        await collect(kind, select(User.id, User.first_name, User.last_name).where(
+            User.id.in_(wanted[kind])), lambda first, last: f"{first} {last}".strip())
+    for event_id in wanted.get("event_sales_activation", set()):
+        labels[("event_sales_activation", event_id)] = "Paid-sales activation"
+    return labels
+
+
+async def event_audit_entries(
+    db: AsyncSession,
+    event: Event,
+    *,
+    action: str | None,
+    action_prefix: str | None,
+    date_from: date | None,
+    date_to: date | None,
+    limit: int,
+    offset: int,
+) -> list[tuple[AuditLog, User | None, str | None]]:
+    """Owner-facing audit log page (newest first) with actor and entity labels."""
+    start, end = resolve_dates(date_from, date_to, event.timezone)
+    actor = aliased(User)
+    stmt = (
+        select(AuditLog, actor)
+        .outerjoin(actor, actor.id == AuditLog.actor_user_id)
+        .where(AuditLog.event_id == event.id, *_in_range(AuditLog.created_at, start, end))
+    )
+    if action:
+        stmt = stmt.where(AuditLog.action == action)
+    if action_prefix:
+        stmt = stmt.where(AuditLog.action.startswith(action_prefix, autoescape=True))
+    rows = (
+        await db.execute(
+            stmt.order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(limit).offset(offset)
+        )
+    ).all()
+    labels = await entity_labels(db, [row[0] for row in rows])
+    return [
+        (
+            entry,
+            author,
+            labels.get((entry.entity_type, entry.entity_id)) if entry.entity_id else None,
+        )
+        for entry, author in rows
+    ]

@@ -996,7 +996,8 @@ class Refund(Base):
     status: Mapped[RefundStatus] = mapped_column(
         Enum(RefundStatus, name="refund_status"), nullable=False, default=RefundStatus.PENDING
     )
-    # CUSTOMER_REQUEST (policy-checked) or EVENT_CANCELLATION (organizer).
+    # CUSTOMER_REQUEST (policy-checked), EVENT_CANCELLATION (organizer cancelled
+    # the event) or ORGANIZER_REQUEST (owner refunded one order).
     kind: Mapped[str] = mapped_column(String(30), nullable=False, default="CUSTOMER_REQUEST")
     currency: Mapped[str] = mapped_column(CHAR(3), nullable=False, default="KZT")
     is_simulated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -1007,7 +1008,8 @@ class Refund(Base):
     __table_args__ = (
         CheckConstraint("amount > 0", name="refunds_amount_positive"),
         CheckConstraint(
-            "kind IN ('CUSTOMER_REQUEST', 'EVENT_CANCELLATION')", name="refunds_kind_valid"
+            "kind IN ('CUSTOMER_REQUEST', 'EVENT_CANCELLATION', 'ORGANIZER_REQUEST')",
+            name="refunds_kind_valid",
         ),
         Index("idx_refunds_order", "order_id"),
         Index("idx_refunds_status_created", "status", text("created_at DESC")),

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
@@ -17,7 +17,7 @@ from app.api.deps import (
 )
 from app.core.config import Settings
 from app.db import repositories as repo
-from app.db.models import Event, EventImage, TicketType, User
+from app.db.models import Event, EventImage, EventSalesActivation, TicketType, User
 from app.schemas.analytics import AnalyticsResponse, TimelinePage
 from app.schemas.event_staff import (
     AssignedEventResponse,
@@ -136,7 +136,9 @@ def _event_summary_response(event: Event) -> EventSummaryResponse:
     )
 
 
-def _ticket_type_response(ticket_type: TicketType) -> TicketTypeResponse:
+def _ticket_type_response(
+    ticket_type: TicketType, available: int | None = None
+) -> TicketTypeResponse:
     return TicketTypeResponse(
         id=ticket_type.id,
         event_id=ticket_type.event_id,
@@ -153,12 +155,21 @@ def _ticket_type_response(ticket_type: TicketType) -> TicketTypeResponse:
         is_hidden=ticket_type.is_hidden,
         created_at=ticket_type.created_at,
         updated_at=ticket_type.updated_at,
+        available=available,
     )
 
 
 async def _event_detail(db: AsyncSession, event: Event) -> EventResponse:
     images = await repo.list_event_images(db, event.id)
-    return _event_detail_response(event, images)
+    response = _event_detail_response(event, images)
+    activation = await db.get(EventSalesActivation, event.id)
+    response.paid_sales_active = (
+        activation is not None
+        and activation.activated_at is not None
+        and activation.sales_suspended_at is None
+        and event.suspended_at is None
+    )
+    return response
 
 
 # ---------- Event staff (existing) ----------
@@ -408,12 +419,18 @@ async def list_event_audit_log(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     action: str | None = Query(default=None, max_length=100),
+    action_prefix: str | None = Query(default=None, max_length=100),
+    date_from: date | None = Query(default=None, alias="from"),
+    date_to: date | None = Query(default=None, alias="to"),
     event: Event = Depends(require_event_owner),
     db: AsyncSession = Depends(get_db),
 ) -> list[AuditEntryResponse]:
-    """Append-only trail for this event. There is deliberately no write route."""
-    entries = await repo.list_event_audit_entries(
-        db, event.id, limit=limit, offset=offset, action=action
+    """Append-only trail for this event, newest first. There is deliberately no
+    write route. ``from``/``to`` are inclusive dates in the event timezone;
+    ``action_prefix`` matches e.g. ``refund.``."""
+    rows = await analytics_service.event_audit_entries(
+        db, event, action=action, action_prefix=action_prefix,
+        date_from=date_from, date_to=date_to, limit=limit, offset=offset,
     )
     return [
         AuditEntryResponse(
@@ -422,8 +439,10 @@ async def list_event_audit_log(
             entity_type=entry.entity_type, entity_id=entry.entity_id,
             event_id=entry.event_id, metadata=entry.meta, before=entry.before_data,
             after=entry.after_data, request_id=entry.request_id,
+            actor_name=f"{author.first_name} {author.last_name}".strip() if author else None,
+            entity_label=label,
         )
-        for entry in entries
+        for entry, author, label in rows
     ]
 
 
@@ -498,7 +517,8 @@ async def list_ticket_types(
     event = await service.get_visible_event(db, event_id, user)
     include_hidden = service.is_authorized_viewer(event, user)
     ticket_types = await repo.list_ticket_types(db, event.id, include_hidden=include_hidden)
-    return [_ticket_type_response(t) for t in ticket_types]
+    available = await inventory_service.availability_by_type(db, event, ticket_types)
+    return [_ticket_type_response(t, available[t.id]) for t in ticket_types]
 
 
 @router.patch(
@@ -626,7 +646,8 @@ async def get_event_analytics(
 
     ``start``/``end`` (UTC if no offset; ``start`` inclusive, ``end``
     exclusive) filter historical metrics only; capacity and attendance rate
-    are current snapshots. See ``definitions`` in the response.
+    are current snapshots. ``sales_over_time`` buckets sales by day in the
+    event timezone. See ``definitions`` in the response.
     """
     start, end = analytics_service.validate_range(start, end)
     event_ids, ticket_type = await analytics_service.resolve_scope(
@@ -636,7 +657,8 @@ async def get_event_analytics(
         ticket_type_id=ticket_type_id,
     )
     return await analytics_service.compute_analytics(
-        db, event_ids=event_ids, ticket_type=ticket_type, start=start, end=end
+        db, event_ids=event_ids, ticket_type=ticket_type, start=start, end=end,
+        tz_name=event.timezone,
     )
 
 

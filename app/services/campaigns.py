@@ -45,6 +45,7 @@ from app.db.models import (
     Event,
     EventStatus,
     Order,
+    OrderItem,
     OrderStatus,
     PromoRedemption,
     PromoRedemptionStatus,
@@ -704,6 +705,15 @@ async def campaign_analytics(db: AsyncSession, campaign: Campaign) -> CampaignAn
         )
     ).one()
 
+    tickets_sold = int(
+        await db.scalar(
+            select(func.count(OrderItem.id))
+            .join(Order, Order.id == OrderItem.order_id)
+            .where(Order.campaign_id == campaign.id, committed)
+        )
+        or 0
+    )
+
     def money(value: Any) -> Decimal:
         return Decimal(value).quantize(CENT)
 
@@ -718,6 +728,7 @@ async def campaign_analytics(db: AsyncSession, campaign: Campaign) -> CampaignAn
         released_redemptions=counts.get("RELEASED", (0, zero))[0],
         discount_total=money(counts.get("REDEEMED", (0, zero))[1]),
         attributed_order_count=int(row[0]),
+        tickets_sold=tickets_sold,
         attributed_revenue=money(row[1]),
         gross_attributed_order_count=int(row[2]),
         gross_attributed_revenue=money(row[3]),

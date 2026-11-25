@@ -2,7 +2,7 @@
 # `make PYTHON=python3 test`.
 PYTHON ?= python
 
-.PHONY: install infra run migrate test lint typecheck check
+.PHONY: install infra run migrate admin test lint typecheck check
 
 install:
 	$(PYTHON) -m pip install -e ".[dev]"
@@ -15,6 +15,10 @@ run:
 
 migrate:
 	$(PYTHON) -m app.db.migrate
+
+# Promote an existing verified account: make admin EMAIL=you@example.com
+admin:
+	$(PYTHON) -m app.db.bootstrap_admin --email "$(EMAIL)"
 
 test:
 	$(PYTHON) -m pytest

@@ -292,7 +292,7 @@ async def test_messages_are_chronological_with_polling_and_pagination(client, ap
     assert [m["body"] for m in full["items"]] == [f"m{i}" for i in range(1, 7)]
     assert [m["sender"]["role"] for m in full["items"]] == [
         "REQUESTER", "ORGANIZER", "REQUESTER", "STAFF", "REQUESTER", "ORGANIZER"]
-    assert full["items"][1]["sender"]["display_name"]
+    assert full["items"][1]["sender"]["name"]
     assert full["latest_sequence"] == 6 and full["has_more"] is False
 
     page1 = (await client.get(path, params={"limit": 2}, headers=bearer(w.owner_token))).json()

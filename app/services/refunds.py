@@ -72,6 +72,9 @@ logger = logging.getLogger("app.refunds")
 
 KIND_CUSTOMER = "CUSTOMER_REQUEST"
 KIND_EVENT_CANCELLATION = "EVENT_CANCELLATION"
+# Full refund initiated by the event owner for one order (SRS 4.9). Not
+# subject to the customer refund policy or deadline.
+KIND_ORGANIZER = "ORGANIZER_REQUEST"
 _COMMITTED = (OrderStatus.PAID, OrderStatus.CONFIRMED)
 _ACTIVE = (OrderStatus.PENDING, *_COMMITTED)
 _CLOSED = (OrderStatus.CANCELLED, OrderStatus.REFUNDED)
@@ -348,22 +351,29 @@ async def _deny(
 async def customer_cancel(
     db: AsyncSession, user: User, order_id: UUID, *, require_refund: bool = False
 ) -> CancellationResult:
-    """Cancel (free) or refund (paid) the caller's own order.
+    """Cancel (free) or refund (paid) an order.
 
-    Only the buyer may do this (a PLATFORM_ADMIN may act on their behalf).
-    Organizers cannot refund individual orders through this path; their
-    lever is event cancellation, which has its own documented policy.
-    Repeating the request returns the stored outcome with ``replayed=True``.
+    Allowed for the buyer, the owner of the order's event (SRS 4.9: organizers
+    cancel free registrations and initiate full refunds), or a PLATFORM_ADMIN.
+    Buyer requests follow the event refund policy; organizer/admin requests
+    are full refunds that bypass the customer policy and deadline. Orders
+    with a checked-in ticket are never refunded. Repeating the request
+    returns the stored outcome with ``replayed=True``.
     """
     order = await _lock_order(db, order_id)
     if order is None:
         raise ApiError(404, "ORDER_NOT_FOUND", "Order not found")
-    if order.buyer_user_id != user.id and user.global_role != UserRole.PLATFORM_ADMIN:
-        raise ApiError(403, "INSUFFICIENT_PERMISSIONS", "Only the buyer can cancel this order")
-    payment = await _lock_payment(db, order.id)
     event = await repo.get_event_by_id(db, order.event_id)
     if event is None:
         raise ApiError(404, "EVENT_NOT_FOUND", "Event not found")
+    is_buyer = order.buyer_user_id == user.id
+    by_organizer = not is_buyer and (
+        event.owner_user_id == user.id or user.global_role == UserRole.PLATFORM_ADMIN
+    )
+    if not is_buyer and not by_organizer:
+        raise ApiError(403, "INSUFFICIENT_PERMISSIONS",
+                       "Only the buyer or the event organizer can cancel this order")
+    payment = await _lock_payment(db, order.id)
     actor_type = _actor_type(user, event)
     now = _now()
 
@@ -395,18 +405,20 @@ async def customer_cancel(
     tickets = await _order_tickets(db, order.id)
     if any(ticket.status == TicketStatus.CHECKED_IN for ticket in tickets):
         raise ApiError(409, "TICKET_ALREADY_CHECKED_IN", "A ticket has already been checked in")
-    if now >= event.starts_at:
+    if now >= event.starts_at and not by_organizer:
         raise ApiError(409, "EVENT_ALREADY_STARTED", "The event has already started")
 
     previous = order.status
     if _paid(order, payment):
         assert payment is not None
-        violation = _policy_violation(event, now)
-        if violation is not None:
-            await _deny(db, user, order, *violation)
+        if not by_organizer:
+            violation = _policy_violation(event, now)
+            if violation is not None:
+                await _deny(db, user, order, *violation)
         refund = await _create_simulated_refund(
             db, order=order, payment=payment, initiated_by=user.id, actor_type=actor_type,
-            kind=KIND_CUSTOMER, reason="Customer cancellation",
+            kind=KIND_ORGANIZER if by_organizer else KIND_CUSTOMER,
+            reason="Organizer refund" if by_organizer else "Customer cancellation",
         )
         await _invalidate(db, order, ticket_status=TicketStatus.REFUNDED, now=now)
         order.status = OrderStatus.REFUNDED
@@ -469,10 +481,14 @@ async def refund_eligibility(db: AsyncSession, user: User, order_id: UUID) -> di
     order = await repo.get_order_by_id(db, order_id)
     if order is None:
         raise ApiError(404, "ORDER_NOT_FOUND", "Order not found")
-    if order.buyer_user_id != user.id and user.global_role != UserRole.PLATFORM_ADMIN:
-        raise ApiError(403, "INSUFFICIENT_PERMISSIONS", "Insufficient permissions")
     event = await repo.get_event_by_id(db, order.event_id)
     assert event is not None
+    is_buyer = order.buyer_user_id == user.id
+    by_organizer = not is_buyer and (
+        event.owner_user_id == user.id or user.global_role == UserRole.PLATFORM_ADMIN
+    )
+    if not is_buyer and not by_organizer:
+        raise ApiError(403, "INSUFFICIENT_PERMISSIONS", "Insufficient permissions")
     payment = await db.scalar(
         select(Payment).where(Payment.order_id == order.id,
                               Payment.provider == SIMULATION_PROVIDER)
@@ -489,9 +505,9 @@ async def refund_eligibility(db: AsyncSession, user: User, order_id: UUID) -> di
     elif any(t.status == TicketStatus.CHECKED_IN
              for t in await repo.list_order_tickets(db, order.id)):
         reason = "TICKET_ALREADY_CHECKED_IN"
-    elif now >= event.starts_at:
+    elif now >= event.starts_at and not by_organizer:
         reason = "EVENT_ALREADY_STARTED"
-    elif paid:
+    elif paid and not by_organizer:
         violation = _policy_violation(event, now)
         reason = violation[0] if violation else None
     return {

@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ApiError
@@ -510,3 +511,41 @@ async def duplicate_event(
     )
     logger.info("event %s duplicated to %s by %s", event.id, copy.id, actor.id)
     return copy
+
+
+async def complete_finished_events(db: AsyncSession, *, limit: int = 100) -> int:
+    """Move PUBLISHED events whose ``ends_at`` has passed to COMPLETED.
+
+    Run by the background loop (idempotent; SKIP LOCKED so it never waits on a
+    checkout that holds the event row). Each transition is audited as SYSTEM.
+    Draft, unpublished and cancelled events keep their status.
+    """
+    now = _now()
+    events = list(
+        (
+            await db.execute(
+                select(Event)
+                .where(Event.status == EventStatus.PUBLISHED, Event.ends_at <= now)
+                .order_by(Event.ends_at.asc())
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+        ).scalars().all()
+    )
+    for event in events:
+        event.status = EventStatus.COMPLETED
+        event.updated_at = now
+        await repo.add_audit_entry(
+            db,
+            actor_user_id=None,
+            actor_type="SYSTEM",
+            event_id=event.id,
+            entity_type="event",
+            entity_id=event.id,
+            action="event.completed",
+            before_data={"status": EventStatus.PUBLISHED.value},
+            after_data={"status": EventStatus.COMPLETED.value},
+        )
+    if events:
+        logger.info("%d finished events marked COMPLETED", len(events))
+    return len(events)

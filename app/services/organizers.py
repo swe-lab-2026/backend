@@ -1,12 +1,19 @@
 import logging
 from datetime import datetime, timezone
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ApiError
 from app.db import repositories as repo
-from app.db.models import OrganizerProfile, PayoutAccount, User
+from app.db.models import (
+    OrganizerProfile,
+    PayoutAccount,
+    PayoutStatus,
+    User,
+    VerificationStatus,
+)
 from app.schemas.organizers import (
     OrganizerProfileCreate,
     OrganizerProfileUpdate,
@@ -168,3 +175,84 @@ async def upsert_payout_account(
         after_data={"provider": account.provider, "is_default": account.is_default},
     )
     return account
+
+
+async def get_payout_account(db: AsyncSession, user: User) -> PayoutAccount:
+    """The organizer's default payout account, else the most recent one."""
+    await get_organizer_profile(db, user)
+    account = await db.scalar(
+        select(PayoutAccount)
+        .where(PayoutAccount.organizer_user_id == user.id)
+        .order_by(PayoutAccount.is_default.desc(), PayoutAccount.created_at.desc())
+        .limit(1)
+    )
+    if account is None:
+        raise ApiError(404, "PAYOUT_ACCOUNT_NOT_FOUND", "No payout account has been added")
+    return account
+
+
+async def set_verification_status(
+    db: AsyncSession,
+    actor: User,
+    profile: OrganizerProfile,
+    status: VerificationStatus,
+    *,
+    action: str,
+    actor_type: str,
+    reason: str | None = None,
+) -> OrganizerProfile:
+    previous = profile.verification_status
+    profile.verification_status = status
+    profile.updated_at = datetime.now(timezone.utc)
+    await repo.add_audit_entry(
+        db, actor_user_id=actor.id, actor_type=actor_type, entity_type="organizer_profile",
+        entity_id=profile.user_id, action=action,
+        before_data={"verification_status": previous.value},
+        after_data={"verification_status": status.value},
+        metadata={"reason": reason, "is_simulated": action.endswith("simulated")},
+    )
+    await db.flush()
+    return profile
+
+
+async def set_payout_status(
+    db: AsyncSession,
+    actor: User,
+    account: PayoutAccount,
+    status: PayoutStatus,
+    *,
+    action: str,
+    actor_type: str,
+    reason: str | None = None,
+) -> PayoutAccount:
+    previous = account.status
+    account.status = status
+    account.updated_at = datetime.now(timezone.utc)
+    await repo.add_audit_entry(
+        db, actor_user_id=actor.id, actor_type=actor_type, entity_type="payout_account",
+        entity_id=account.id, action=action,
+        before_data={"status": previous.value}, after_data={"status": status.value},
+        metadata={"reason": reason, "is_simulated": action.endswith("simulated")},
+    )
+    await db.flush()
+    return account
+
+
+async def simulate_verification(db: AsyncSession, user: User) -> OrganizerProfile:
+    profile = await get_organizer_profile(db, user)
+    if profile.verification_status == VerificationStatus.VERIFIED:
+        return profile
+    return await set_verification_status(
+        db, user, profile, VerificationStatus.VERIFIED,
+        action="organizer.verification_simulated", actor_type="ORGANIZER",
+    )
+
+
+async def simulate_payout_approval(db: AsyncSession, user: User) -> PayoutAccount:
+    account = await get_payout_account(db, user)
+    if account.status == PayoutStatus.ACTIVE:
+        return account
+    return await set_payout_status(
+        db, user, account, PayoutStatus.ACTIVE,
+        action="organizer.payout_approval_simulated", actor_type="ORGANIZER",
+    )

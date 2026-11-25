@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
@@ -12,6 +13,8 @@ from app.db.models import (
     EventStatus,
     HoldStatus,
     InventoryHold,
+    Order,
+    OrderItem,
     TicketStatus,
     TicketType,
     User,
@@ -33,6 +36,50 @@ DEFAULT_HOLD_TTL_MINUTES = 10
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+async def availability_by_type(
+    db: AsyncSession, event: Event, ticket_types: list[TicketType]
+) -> dict[UUID, int]:
+    """Purchasable tickets per type, in a fixed number of grouped queries.
+
+    capacity - sold (PAID/CONFIRMED items) - active unexpired holds, capped by
+    the remaining event capacity. Read-only; takes no locks.
+    """
+    now = _now()
+    sold = dict(
+        (await db.execute(
+            select(OrderItem.ticket_type_id, func.count(OrderItem.id))
+            .join(Order, Order.id == OrderItem.order_id)
+            .where(Order.event_id == event.id, Order.status.in_(repo.COMMITTED_ORDER_STATUSES))
+            .group_by(OrderItem.ticket_type_id)
+        )).tuples().all()
+    )
+    held = dict(
+        (await db.execute(
+            select(InventoryHold.ticket_type_id, func.sum(InventoryHold.quantity))
+            .where(
+                InventoryHold.event_id == event.id,
+                InventoryHold.status == HoldStatus.ACTIVE,
+                InventoryHold.expires_at > now,
+            )
+            .group_by(InventoryHold.ticket_type_id)
+        )).tuples().all()
+    )
+    event_left: int | None = None
+    if event.capacity is not None:
+        used = sum(int(v) for v in sold.values()) + sum(int(v or 0) for v in held.values())
+        event_left = max(event.capacity - used, 0)
+    result: dict[UUID, int] = {}
+    for ticket_type in ticket_types:
+        left = max(
+            ticket_type.capacity
+            - int(sold.get(ticket_type.id, 0))
+            - int(held.get(ticket_type.id, 0) or 0),
+            0,
+        )
+        result[ticket_type.id] = min(left, event_left) if event_left is not None else left
+    return result
 
 
 async def get_event_inventory(db: AsyncSession, event: Event) -> EventInventoryResponse:

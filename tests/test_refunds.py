@@ -251,22 +251,45 @@ async def test_cancellation_by_unauthorized_customer(client, app, db):
     assert await db.scalar(select(func.count()).select_from(Refund)) == 0
 
 
-async def test_organizers_cannot_refund_orders_directly(client, app, db):
+async def test_event_owner_can_refund_and_cancel_orders_of_own_event(client, app, db):
+    """SRS 4.9: organizers cancel free registrations and initiate full refunds."""
     _owner, owner_token, event, ga, _vip = await _setup(client, app, db, prefix="orgref")
     _token, order = await _paid_order(client, app, db, event, ga, "orgref-buyer@example.com")
     _other, other_token = await _create_owner(client, app, db, "orgref-other@example.com")
-    # Neither the event owner (bypassing the disabled policy) nor another
-    # organizer may refund a customer's order through the order endpoints.
-    for token in (owner_token, other_token):
-        for path in ("refund", "cancel"):
-            response = await client.post(f"{API}/orders/{order['id']}/{path}",
-                                         headers=bearer(token))
-            assert response.status_code == 403, response.text
+    # Another organizer is never allowed.
+    for path in ("refund", "cancel"):
+        response = await client.post(f"{API}/orders/{order['id']}/{path}",
+                                     headers=bearer(other_token))
+        assert response.status_code == 403, response.text
     other_cancel = await client.post(f"{API}/events/{event['id']}/cancel",
                                      headers=bearer(other_token))
     assert other_cancel.status_code == 403
     assert (await _fresh(db, Order, order["id"])).status == OrderStatus.PAID
-    assert await db.scalar(select(func.count()).select_from(Refund)) == 0
+
+    # The owner refunds although customer refunds are disabled by policy.
+    eligibility = await client.get(f"{API}/orders/{order['id']}/refund-eligibility",
+                                   headers=bearer(owner_token))
+    assert eligibility.json()["refundable"] is True
+    refunded = await client.post(f"{API}/orders/{order['id']}/refund",
+                                 headers=bearer(owner_token))
+    assert refunded.status_code == 200, refunded.text
+    assert refunded.json()["order_status"] == "REFUNDED"
+    assert refunded.json()["refund"]["kind"] == "ORGANIZER_REQUEST"
+    assert refunded.json()["refund"]["amount"] == "25.75"  # full amount charged
+    assert {t.status for t in await _tickets(db, order["id"])} == {TicketStatus.REFUNDED}
+    replay = await client.post(f"{API}/orders/{order['id']}/refund", headers=bearer(owner_token))
+    assert replay.json()["replayed"] is True
+    assert await db.scalar(select(func.count()).select_from(Refund)) == 1
+
+    # Free registration: the owner cancels it, no monetary refund.
+    free_owner_token, free_event, free_type = await _free_event(client, app, db, "orgfree")
+    _b, buyer_token = await _buyer(app, db, "orgfree-buyer@example.com")
+    free_order = (await _order(client, buyer_token, free_event["id"], [_item(free_type)])).json()
+    cancelled = await client.post(f"{API}/orders/{free_order['id']}/cancel",
+                                  headers=bearer(free_owner_token))
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "CANCELLED"
+    assert await db.scalar(select(func.count()).select_from(Refund)) == 1
 
 
 async def test_repeated_refund_requests_are_idempotent(client, app, db):

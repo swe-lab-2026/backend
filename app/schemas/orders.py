@@ -2,7 +2,7 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from app.schemas.tickets import TicketResponse
 
@@ -10,6 +10,21 @@ from app.schemas.tickets import TicketResponse
 class OrderItemRequest(BaseModel):
     ticket_type_id: UUID
     quantity: int = Field(ge=1, le=100)
+
+
+class AttendeeRequest(BaseModel):
+    """Who a ticket is for. One entry per ticket."""
+
+    ticket_type_id: UUID
+    full_name: str = Field(min_length=1, max_length=200)
+    email: EmailStr
+
+    @field_validator("full_name")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("full_name must not be blank")
+        return value.strip()
 
 
 class OrderCreateRequest(BaseModel):
@@ -25,11 +40,25 @@ class OrderCreateRequest(BaseModel):
     promo_code: str | None = Field(default=None, min_length=1, max_length=40)
     # Opaque token from a campaign QR link (alternative to typing a code).
     campaign_token: UUID | None = None
+    # Optional per-ticket attendee details; when omitted every ticket is
+    # issued to the buyer account (previous behaviour).
+    attendees: list[AttendeeRequest] | None = Field(default=None, max_length=100)
 
     @model_validator(mode="after")
     def _single_promotion(self) -> "OrderCreateRequest":
         if self.promo_code is not None and self.campaign_token is not None:
             raise ValueError("Provide either promo_code or campaign_token, not both")
+        if self.attendees is not None:
+            wanted: dict[UUID, int] = {}
+            for item in self.items:
+                wanted[item.ticket_type_id] = wanted.get(item.ticket_type_id, 0) + item.quantity
+            given: dict[UUID, int] = {}
+            for attendee in self.attendees:
+                given[attendee.ticket_type_id] = given.get(attendee.ticket_type_id, 0) + 1
+            if wanted != given:
+                raise ValueError(
+                    "attendees must contain exactly one entry per ticket of each ticket type"
+                )
         return self
 
 

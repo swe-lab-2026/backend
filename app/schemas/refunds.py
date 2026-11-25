@@ -91,3 +91,6 @@ class AuditEntryResponse(BaseModel):
     before: dict[str, Any] | None
     after: dict[str, Any] | None
     request_id: str | None
+    actor_name: str | None = None
+    # Human-readable name of the entity, e.g. "Order #1042" or a ticket type name.
+    entity_label: str | None = None

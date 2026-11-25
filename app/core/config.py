@@ -58,6 +58,7 @@ class Settings(BaseSettings):
         "sql/migrate_007_campaigns.sql",
         "sql/migrate_008_refunds_audit.sql",
         "sql/migrate_009_support_admin_analytics.sql",
+        "sql/migrate_010_organizer_refunds.sql",
     ]
 
     # --- Tickets / checkout ------------------------------------------------
@@ -71,6 +72,10 @@ class Settings(BaseSettings):
     # no production domain is assumed.
     public_web_base_url: str = ""
     order_reservation_ttl_minutes: int = Field(default=10, ge=1, le=1440)
+    # Academic MVP demo helpers (organizer verification / payout approval
+    # self-service). Set DEMO_SIMULATIONS_ENABLED=false to require a
+    # Platform Admin for both instead.
+    demo_simulations_enabled: bool = True
     reservation_cleanup_interval_seconds: int = Field(default=60, ge=1, le=3600)
     reservation_cleanup_enabled: bool = True
     notification_retry_interval_seconds: int = Field(default=60, ge=1, le=3600)
