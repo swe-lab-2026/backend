@@ -1275,7 +1275,7 @@ duplicates collapse.
 | `GET` · `POST` | `/api/v1/admin/disputes` | List / record a dispute against a captured payment |
 | `PATCH` | `/api/v1/admin/disputes/{id}` | `OPEN → UNDER_REVIEW → RESOLVED \| REJECTED` |
 | `GET` | `/api/v1/admin/campaigns` | All campaigns (`q`: name, code, event title) with `effective_status`, `redemption_count` |
-| `GET` | `/api/v1/admin/export/{users\|events\|orders\|payments}.csv` | CSV export (≤ 10,000 rows, same `q`, formula-safe cells, audited) |
+| `GET` | `/api/v1/admin/export/{users\|events\|orders\|payments}.csv` | CSV export (≤ 10,000 rows; same `q` and `status` filters as the lists, invalid `status` → 422; `X-Truncated: true` when the limit cut the file, `X-Total-Count` = data rows in the file; formula-safe cells, audited) |
 | `POST` | `/api/v1/admin/organizers/{user_id}/verification` | `{"status": "VERIFIED\|REJECTED\|PENDING", "reason"?}` |
 | `POST` | `/api/v1/admin/payout-accounts/{id}/status` | `{"status": "ACTIVE\|BLOCKED\|PENDING", "reason"?}` |
 | `GET` | `/api/v1/admin/support/escalated` | Escalated attendee support cases |
@@ -1342,9 +1342,7 @@ fixed number of queries). The response includes `definitions`.
 | `sales[].gross_revenue` | Σ `total_amount` charged = ticket_revenue + fees |
 | `sales[].refunds` | Σ `SUCCEEDED` refund amounts by `completed_at` |
 | `sales[].net_revenue` | gross_revenue − refunds |
-| `sales[].refunded_ticket_revenue` | Σ `final_price` of items in orders with a `SUCCEEDED` refund, by `completed_at` |
-| `sales[].refunded_fees` | refunds − refunded_ticket_revenue (null with a ticket type filter) |
-| `sales[].estimated_payout` | ticket_revenue − refunded_ticket_revenue (demo estimate, see below) |
+| `sales[].estimated_payout` | Σ `final_price` of orders paid in range that are not `CANCELLED`/`REFUNDED`; no fees; null with a ticket type filter |
 | `campaigns[]` | redemption counts (snapshot) and attributed orders/tickets/discounts/revenue by `paid_at` |
 
 Money is grouped per currency and never combined.
@@ -1360,15 +1358,13 @@ one per bar.
 `sales_over_time.gross` exclude the 3% fee; `fees` is the fee; `gross_revenue`,
 `refunds` and `net_revenue` include it (refunds return the full amount charged).
 
-**Estimated payout (demo only, no money moves)**: `estimated_payout =
-ticket_revenue − refunded_ticket_revenue`. The processing fee is paid by the
-buyer and kept by the platform, so it is never part of the payout. On a full
-refund the platform returns its fee (`refunded_fees`) and the organizer returns
-the ticket revenue after discounts (`refunded_ticket_revenue`). The one-time
-paid-sales activation fee is charged separately and is not deducted. Sales are
-counted by `orders.paid_at` and refunds by `refunds.completed_at` within
-`[start, end)`; with no range the estimate covers all time, so a sale and its
-refund can fall in different periods.
+**Estimated payout (demo only, no money moves)**: the ticket price after
+discounts (`final_price`) of orders paid in `[start, end)` that are not
+cancelled or refunded now. Processing fees are paid by the buyer to the
+platform and are excluded; the one-time paid-sales activation fee is not
+deducted. A refund removes the order from the period in which it was paid. The
+value is a decimal string like other amounts and is `null` with `ticket_type_id`,
+like `fees`.
 
 ### Event history and timeline
 

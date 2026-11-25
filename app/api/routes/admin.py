@@ -359,24 +359,54 @@ async def list_campaigns(
 async def export_csv(
     kind: Literal["users", "events", "orders", "payments"],
     q: str | None = Query(default=None, min_length=1, max_length=200),
+    status: str | None = Query(
+        default=None, min_length=1, max_length=40,
+        description="Same values as the status filter of the matching JSON list.",
+    ),
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    """CSV export (newest first, at most 10,000 rows) with the same ``q`` search
-    and redaction as the JSON lists. Formula-like cells are prefixed with '."""
-    rows = await service.export_rows(db, kind, q=q)
+    """CSV export (newest first, at most 10,000 rows) with the same ``q`` and
+    ``status`` filters and redaction as the JSON lists. Formula-like cells are
+    prefixed with '. ``X-Truncated: true`` means more rows matched than the
+    limit; ``X-Total-Count`` is the number of data rows in the file."""
+    status_enum = _EXPORT_STATUS[kind]
+    status_value = None
+    if status is not None:
+        try:
+            status_value = status_enum(status)
+        except ValueError as exc:
+            raise ApiError(
+                422, "VALIDATION_ERROR", f"Invalid status for {kind} export",
+                details={"field": "status", "allowed": [s.value for s in status_enum]},
+            ) from exc
+    rows, truncated = await service.export_rows(db, kind, q=q, status=status_value)
     buffer = io.StringIO()
     csv.writer(buffer).writerows(rows)
     await repo.add_audit_entry(
         db, actor_user_id=admin.id, actor_type="PLATFORM_ADMIN", entity_type="export",
         entity_id=None, action="admin.data_exported",
-        metadata={"kind": kind, "q": q, "rows": len(rows) - 1},
+        metadata={"kind": kind, "q": q, "status": status, "rows": len(rows) - 1,
+                  "truncated": truncated},
     )
     return Response(
         content=buffer.getvalue(),
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{kind}.csv"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{kind}.csv"',
+            "X-Truncated": "true" if truncated else "false",
+            "X-Total-Count": str(len(rows) - 1),
+        },
     )
+
+
+_EXPORT_STATUS: dict[str, type[UserStatus] | type[EventStatus] | type[OrderStatus]
+                     | type[PaymentStatus]] = {
+    "users": UserStatus,
+    "events": EventStatus,
+    "orders": OrderStatus,
+    "payments": PaymentStatus,
+}
 
 
 # ---------- Disputes ----------

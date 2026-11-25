@@ -526,7 +526,6 @@ async def test_analytics_figures_match_order_payment_and_refund_records(client, 
         "gross_ticket_sales": _d("175"), "discounts": _d("5"), "ticket_revenue": _d("170"),
         "fees": _d("5.10"), "gross_revenue": _d("175.10"), "refund_count": 1,
         "refunds": _d("25.75"), "net_revenue": _d("149.35"),
-        "refunded_ticket_revenue": _d("25"), "refunded_fees": _d("0.75"),
         "estimated_payout": _d("145"),
     }
     # gross_revenue equals what customers were charged (no double discount).
@@ -566,8 +565,7 @@ async def test_analytics_figures_match_order_payment_and_refund_records(client, 
     assert ga_sales["fees"] is None
     assert ga_sales["gross_revenue"] == _d("70") and ga_sales["refunds"] == _d("25")
     assert ga_sales["net_revenue"] == _d("45")
-    assert ga_sales["refunded_fees"] is None
-    assert ga_sales["estimated_payout"] == _d("45")
+    assert ga_sales["estimated_payout"] is None
     assert [t["name"] for t in ga_only["ticket_types"]] == ["General Admission"]
     assert ga_only["capacity"]["total_capacity"] == 10
     assert ga_only["campaigns"][0]["sales"][0]["revenue"] == _d("45")
@@ -623,6 +621,7 @@ async def test_estimated_payout_for_discounted_then_refunded_order(client, app, 
     assert (before["gross_ticket_sales"], before["discounts"], before["fees"]) == (
         _d("150"), _d("5"), _d("4.35"))
     assert before["refunds"] == _d("0") and before["estimated_payout"] == _d("145")
+    assert before["estimated_payout"] == _d(str(Decimal(before["ticket_revenue"])))
 
     assert (await _post(client, a_token, f"/orders/{a['id']}/refund")).status_code == 200
     data = (await _get(client, owner_token, path)).json()
@@ -631,14 +630,15 @@ async def test_estimated_payout_for_discounted_then_refunded_order(client, app, 
     assert after["discounts"] == _d("5")
     assert after["fees"] == _d("4.35")
     assert after["refunds"] == _d("46.35")
-    assert after["refunded_ticket_revenue"] == _d("45")
-    assert after["refunded_fees"] == _d("1.35")
+    # Only the kept VIP order counts, at its price after discounts, without fees.
     assert after["estimated_payout"] == _d("100")
+    assert isinstance(after["estimated_payout"], str)  # decimal string like other amounts
     assert "estimated_payout" in data["definitions"]
-    # Every KZT component is distinct and the estimate reconciles with them.
-    assert Decimal(after["estimated_payout"]) == (
-        Decimal(after["gross_ticket_sales"]) - Decimal(after["discounts"])
-        - Decimal(after["refunded_ticket_revenue"]))
+
+    # Like fees, the estimate is not attributable to one ticket type.
+    [vip_only] = (await _get(client, owner_token, path,
+                             ticket_type_id=vip["id"])).json()["sales"]
+    assert vip_only["fees"] is None and vip_only["estimated_payout"] is None
 
     # Time range: a window that ends before any sale reports nothing.
     past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
