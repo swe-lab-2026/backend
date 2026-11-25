@@ -57,6 +57,7 @@ from app.schemas.admin import (
     AdminEventResponse,
     AdminOrderResponse,
     AdminPaymentResponse,
+    AdminPayoutAccountResponse,
     AdminRefundResponse,
     AdminUserResponse,
     DisputeResponse,
@@ -68,6 +69,7 @@ from app.schemas.admin import (
 from app.services import notifications
 from app.services.analytics import validate_range
 from app.services.campaigns import effective_status
+from app.services.organizers import mask_external_account_ref
 
 logger = logging.getLogger("app.admin")
 
@@ -734,6 +736,48 @@ async def list_activations(
         for a, title, owner_id, display_name, verification, has_payout in rows
     ]
     return Page[AdminActivationResponse](items=items, total=total, limit=limit, offset=offset)
+
+
+async def list_payout_accounts(
+    db: AsyncSession, *, status: PayoutStatus | None, q: str | None, limit: int, offset: int
+) -> Page[AdminPayoutAccountResponse]:
+    """Payout accounts for the approval queue; ``q`` matches organizer name or email."""
+    conditions: list[Any] = []
+    if status is not None:
+        conditions.append(PayoutAccount.status == status)
+    if q:
+        conditions.append(or_(
+            OrganizerProfile.display_name.ilike(_pattern(q), escape="\\"),
+            User.email.ilike(_pattern(q), escape="\\"),
+        ))
+    rows, total = await _page(
+        db,
+        select(PayoutAccount, OrganizerProfile.display_name,
+               OrganizerProfile.verification_status, User.email)
+        .join(OrganizerProfile, OrganizerProfile.user_id == PayoutAccount.organizer_user_id)
+        .outerjoin(User, User.id == PayoutAccount.organizer_user_id)
+        .where(*conditions),
+        select(func.count(PayoutAccount.id))
+        .join(OrganizerProfile, OrganizerProfile.user_id == PayoutAccount.organizer_user_id)
+        .outerjoin(User, User.id == PayoutAccount.organizer_user_id)
+        .where(*conditions),
+        order=(PayoutAccount.updated_at.desc(), PayoutAccount.id.desc()),
+        limit=limit, offset=offset,
+    )
+    items = [
+        AdminPayoutAccountResponse(
+            id=a.id,
+            organizer=PersonRef(id=a.organizer_user_id, name=display_name or ""),
+            organizer_email=email,
+            organizer_verification_status=verification.value,
+            provider=a.provider,
+            external_account_ref=mask_external_account_ref(a.external_account_ref),
+            status=a.status.value, is_default=a.is_default,
+            created_at=a.created_at, updated_at=a.updated_at,
+        )
+        for a, display_name, verification, email in rows
+    ]
+    return Page[AdminPayoutAccountResponse](items=items, total=total, limit=limit, offset=offset)
 
 
 async def list_refunds(

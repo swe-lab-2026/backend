@@ -162,6 +162,20 @@ class AdminActivationResponse(BaseModel):
     updated_at: datetime
 
 
+class AdminPayoutAccountResponse(BaseModel):
+    id: UUID
+    organizer: PersonRef
+    organizer_email: str | None
+    organizer_verification_status: str
+    provider: str
+    # Masked like the organizer-facing response: never the full reference.
+    external_account_ref: str
+    status: str
+    is_default: bool
+    created_at: datetime
+    updated_at: datetime
+
+
 class AdminRefundResponse(BaseModel):
     id: UUID
     order_id: UUID
