@@ -126,6 +126,69 @@ async def test_ticket_type_availability_and_paid_sales_flag(client, app, db):
     del vip
 
 
+async def test_organizer_inventory_respects_shared_event_capacity(client, app, db):
+    """Two types with 10 places each under an event cap of 3: the organizer
+    total must match the shared cap through checkout, expiry, cancellation
+    and refund, and per-type availability must match the public view."""
+    from app.db.models import InventoryHold, Order
+    from tests.test_refunds import _enable_refunds
+
+    _owner, owner_token, event, ga, vip = await _setup(client, app, db, prefix="invcap")
+    await _enable_refunds(client, owner_token, event["id"])
+    await client.patch(f"{API}/events/{event['id']}", json={"capacity": 3},
+                       headers=bearer(owner_token))
+    _b, token = await _buyer(app, db, "invcap-buyer@example.com")
+
+    async def inventory():
+        response = await client.get(f"{API}/events/{event['id']}/inventory",
+                                    headers=bearer(owner_token))
+        assert response.status_code == 200, response.text
+        body = response.json()
+        public = {t["id"]: t["available"] for t in (await client.get(
+            f"{API}/events/{event['id']}/ticket-types")).json()}
+        for item in body["ticket_types"]:
+            assert item["available"] == public[item["ticket_type_id"]]
+            assert item["available"] <= item["type_remaining"]
+        return body
+
+    body = await inventory()
+    assert body["event_remaining"] == 3 and body["total_available"] == 3
+    assert {t["available"] for t in body["ticket_types"]} == {3}
+    assert {t["type_remaining"] for t in body["ticket_types"]} == {10}
+
+    paid = (await _order(client, token, event["id"], [_item(ga)])).json()
+    await _pay(client, token, paid["id"])
+    pending = (await _order(client, token, event["id"], [_item(vip)])).json()
+    body = await inventory()
+    assert (body["total_sold"], body["total_reserved"]) == (1, 1)
+    assert body["event_remaining"] == 1 and body["total_available"] == 1
+
+    # Expire the pending reservation: its place returns to the shared pool.
+    expired = datetime.now(timezone.utc) - timedelta(minutes=1)
+    await db.execute(update(InventoryHold)
+                     .where(InventoryHold.order_id == UUID(pending["id"]))
+                     .values(expires_at=expired))
+    await db.execute(update(Order).where(Order.id == UUID(pending["id"]))
+                     .values(expires_at=expired))
+    await db.commit()
+    body = await inventory()
+    assert body["total_reserved"] == 0 and body["total_available"] == 2
+
+    to_cancel = (await _order(client, token, event["id"], [_item(vip)])).json()
+    cancelled = await client.post(f"{API}/orders/{to_cancel['id']}/cancel",
+                                  headers=bearer(token))
+    assert cancelled.status_code == 200, cancelled.text
+    body = await inventory()
+    assert body["total_available"] == 2
+
+    refunded = await client.post(f"{API}/orders/{paid['id']}/refund", headers=bearer(token))
+    assert refunded.status_code == 200, refunded.text
+    body = await inventory()
+    assert body["total_sold"] == 0 and body["total_available"] == 3
+    ga_row = next(t for t in body["ticket_types"] if t["ticket_type_id"] == ga["id"])
+    assert ga_row["returned"] == 1 and ga_row["type_remaining"] == 10
+
+
 async def test_order_accepts_one_attendee_per_ticket(client, app, db):
     _owner, _owner_token, event, ga, vip = await _setup(client, app, db, prefix="att")
     buyer, token = await _buyer(app, db, "att-buyer@example.com")

@@ -96,7 +96,7 @@ async def validate_ticket(
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
 ) -> TicketValidationResponse:
-    ticket, reason = await ticket_service.validate_ticket_qr(
+    ticket, reason, admission_status = await ticket_service.validate_ticket_qr(
         db,
         event=event,
         qr_payload=payload.qr_payload,
@@ -106,6 +106,7 @@ async def validate_ticket(
     return TicketValidationResponse(
         valid=reason is None,
         reason=reason,
+        admission_status=admission_status,
         ticket=ticket,
     )
 

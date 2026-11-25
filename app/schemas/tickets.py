@@ -35,7 +35,11 @@ class TicketValidateRequest(BaseModel):
 
 class TicketValidationResponse(BaseModel):
     valid: bool
+    # Legacy reason (TICKET_CHECKED_IN, TICKET_CANCELLED, TICKET_REFUNDED).
     reason: str | None
+    # VALID, ALREADY_CHECKED_IN, CANCELLED or REFUNDED; rejections raised as
+    # errors carry the same field in ``error.details.admission_status``.
+    admission_status: str
     ticket: TicketResponse
 
 

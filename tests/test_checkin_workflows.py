@@ -530,6 +530,73 @@ async def test_refunded_and_cancelled_tickets_cannot_be_admitted(client, app, db
         assert denied.json()["error"]["code"] == "TICKET_NOT_VALID"
 
 
+async def test_admission_result_contract(client, app, db):
+    """Every scan outcome exposes a machine-readable ``admission_status``
+    while keeping the legacy error codes mobile clients already handle."""
+    event_id, ticket_type_id, _owner, owner_token, _buyer, buyer_token = (
+        await _setup_event(client, app, db)
+    )
+    other_event_id, other_type_id = await _create_published_event(
+        client, owner_token, title="Contract second event"
+    )
+    order = await _buy(client, buyer_token, event_id, ticket_type_id, quantity=3)
+    refunded, cancelled, usable = order["tickets"]
+    other = (await _buy(client, buyer_token, other_event_id, other_type_id))["tickets"][0]
+
+    refunded_row = await db.get(Ticket, UUID(refunded["ticket_id"]))
+    cancelled_row = await db.get(Ticket, UUID(cancelled["ticket_id"]))
+    assert refunded_row is not None and cancelled_row is not None
+    refunded_row.status = TicketStatus.REFUNDED
+    cancelled_row.status = TicketStatus.CANCELLED
+    cancelled_row.cancelled_at = _now()
+    await db.commit()
+
+    async def scan(payload, path="check-in"):
+        return await client.post(f"{API}/events/{event_id}/{path}",
+                                 json={"qr_payload": payload}, headers=bearer(owner_token))
+
+    tampered = usable["qr_payload"][:-2] + ("AA" if not usable["qr_payload"].endswith("AA")
+                                            else "BB")
+    rejections = [
+        ("not-a-ticket", 401, "INVALID_TICKET_QR", "INVALID_QR"),
+        (tampered, 401, "INVALID_TICKET_QR", "INVALID_QR"),
+        (other["qr_payload"], 404, "TICKET_NOT_FOUND", "WRONG_EVENT"),
+        (cancelled["qr_payload"], 409, "TICKET_NOT_VALID", "CANCELLED"),
+        (refunded["qr_payload"], 409, "TICKET_NOT_VALID", "REFUNDED"),
+    ]
+    for payload, status_code, code, admission in rejections:
+        response = await scan(payload)
+        assert response.status_code == status_code, (admission, response.text)
+        error = response.json()["error"]
+        assert error["code"] == code
+        assert error["details"]["admission_status"] == admission
+
+    for ticket, admission in ((cancelled, "CANCELLED"), (refunded, "REFUNDED")):
+        validated = (await scan(ticket["qr_payload"], "tickets/validate")).json()
+        assert validated["valid"] is False
+        assert validated["admission_status"] == admission
+        manual = await client.post(
+            f"{API}/events/{event_id}/tickets/{ticket['public_id']}/check-in",
+            headers=bearer(owner_token))
+        assert manual.status_code == 409, manual.text
+        assert manual.json()["error"]["code"] == "TICKET_NOT_VALID"
+        assert manual.json()["error"]["details"]["admission_status"] == admission
+
+    validated = (await scan(usable["qr_payload"], "tickets/validate")).json()
+    assert validated["valid"] is True and validated["admission_status"] == "VALID"
+    admitted = await scan(usable["qr_payload"])
+    assert admitted.status_code == 200, admitted.text
+    duplicate = await scan(usable["qr_payload"])
+    assert duplicate.status_code == 409
+    error = duplicate.json()["error"]
+    assert error["code"] == "TICKET_ALREADY_CHECKED_IN"
+    assert error["details"]["admission_status"] == "ALREADY_CHECKED_IN"
+    assert error["details"]["checked_in_at"] is not None
+    validated = (await scan(usable["qr_payload"], "tickets/validate")).json()
+    assert validated["reason"] == "TICKET_CHECKED_IN"
+    assert validated["admission_status"] == "ALREADY_CHECKED_IN"
+
+
 async def test_attendance_stats_before_and_after_reversal(client, app, db):
     event_id, ticket_type_id, _owner, owner_token, _buyer, buyer_token = (
         await _setup_event(client, app, db)

@@ -205,6 +205,14 @@ def _format_detail(key: str, value: Any) -> str:
     return str(value)
 
 
+async def _buyer_locale(db: AsyncSession, order: Order) -> str:
+    """The buyer's preferred email language; English for guests or unknown."""
+    if order.buyer_user_id is None:
+        return "en"
+    buyer = await repo.get_user_by_id(db, order.buyer_user_id)
+    return buyer.locale if buyer is not None and buyer.locale else "en"
+
+
 async def _deliver_lifecycle(
     db: AsyncSession, notification: OrderNotification, provider: EmailProvider
 ) -> bool:
@@ -230,6 +238,7 @@ async def _deliver_lifecycle(
         event_starts_at=event.starts_at,
         venue=event.venue_name or event.city,
         details=details,
+        locale=await _buyer_locale(db, order),
     )
     try:
         await provider.send_notification(message)
@@ -304,6 +313,7 @@ async def deliver_notification(
         event_starts_at=event.starts_at,
         venue=event.venue_name or event.city,
         tickets=ticket_messages,
+        locale=await _buyer_locale(db, order),
     )
     now = _now()
     notification.attempts += 1

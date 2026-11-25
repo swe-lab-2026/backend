@@ -125,6 +125,23 @@ DEFINITIONS: dict[str, str] = {
         "With a ticket type filter: final_price of that type's items in refunded orders."
     ),
     "net_revenue": "gross_revenue - refunds for the same period and currency.",
+    "refunded_ticket_revenue": (
+        "Ticket portion of SUCCEEDED refunds in the period: sum of order_items.final_price "
+        "(after discounts) of refunded orders, by refunds.completed_at."
+    ),
+    "refunded_fees": (
+        "Processing fee portion of those refunds: refunds - refunded_ticket_revenue. "
+        "Null when a ticket type filter is applied."
+    ),
+    "estimated_payout": (
+        "DEMO ESTIMATE, no money moves. ticket_revenue - refunded_ticket_revenue. "
+        "Processing fees are paid by the buyer and kept by the platform, so they are "
+        "never part of the payout; on a full refund the platform returns its fee and "
+        "the organizer returns the ticket revenue (after discounts). The one-time paid "
+        "sales activation fee is charged separately and is not deducted. Sales use "
+        "orders.paid_at and refunds use refunds.completed_at within [start, end); with "
+        "no range the estimate covers all time."
+    ),
     "tickets_reversed": (
         "Items sold in the period whose order is now CANCELLED or REFUNDED."
     ),
@@ -255,6 +272,7 @@ class _CurrencyAcc:
     order_total: Decimal = ZERO
     refund_count: int = 0
     refunds: Decimal = ZERO
+    refunded_ticket_revenue: Decimal = ZERO
 
 
 @dataclass
@@ -465,6 +483,19 @@ async def compute_analytics(
             ):
             currencies[currency].refund_count = int(count)
             currencies[currency].refunds = _money(amount)
+        # Ticket share of those refunds (full-order refunds: every item's final price).
+        for currency, ticket_amount in await _fetch(db,
+                select(
+                    Order.currency,
+                    func.coalesce(func.sum(OrderItem.final_price), 0),
+                )
+                .select_from(Refund)
+                .join(Order, Order.id == Refund.order_id)
+                .join(OrderItem, OrderItem.order_id == Order.id)
+                .where(*refund_conditions)
+                .group_by(Order.currency)
+            ):
+            currencies[currency].refunded_ticket_revenue = _money(ticket_amount)
     else:
         # Refunds are full-order, so every item of the type in a refunded
         # order was refunded at its final price.
@@ -482,6 +513,7 @@ async def compute_analytics(
             ):
             currencies[currency].refund_count = int(count)
             currencies[currency].refunds = _money(amount)
+            currencies[currency].refunded_ticket_revenue = _money(amount)
 
     sales = []
     for currency in sorted(currencies):
@@ -501,6 +533,12 @@ async def compute_analytics(
                 refund_count=acc.refund_count,
                 refunds=acc.refunds,
                 net_revenue=gross_revenue - acc.refunds,
+                refunded_ticket_revenue=acc.refunded_ticket_revenue,
+                refunded_fees=(
+                    None if tt_id is not None
+                    else acc.refunds - acc.refunded_ticket_revenue
+                ),
+                estimated_payout=acc.ticket_revenue - acc.refunded_ticket_revenue,
             )
         )
 
