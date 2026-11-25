@@ -174,6 +174,15 @@ def _in_range(column: Any, start: datetime | None, end: datetime | None) -> list
     return conditions
 
 
+async def _fetch(db: AsyncSession, stmt: Any) -> list[Any]:
+    """All rows of a query, typed as ``Any``.
+
+    SQLAlchemy 2.1 types unpacked multi-column result rows as ``object``; the
+    row shape of every call is fixed by the SELECT list right next to it.
+    """
+    return list((await db.execute(stmt)).all())
+
+
 # ---------- Authorization scope ----------
 
 def has_analytics_permission(permissions: dict[str, Any] | None) -> bool:
@@ -186,13 +195,11 @@ async def analytics_event_filter(db: AsyncSession, user: User) -> Any:
     Deliberately relationship based: a global role (even PLATFORM_ADMIN) does
     not widen the organizer's aggregated scope.
     """
-    staff_rows = (
-        await db.execute(
+    staff_rows = await _fetch(db, 
             select(EventStaff.event_id, EventStaff.permissions).where(
                 EventStaff.user_id == user.id
             )
         )
-    ).all()
     staff_ids = [event_id for event_id, perms in staff_rows if has_analytics_permission(perms)]
     clauses = [Event.owner_user_id == user.id]
     if staff_ids:
@@ -340,14 +347,12 @@ async def compute_analytics(
     per_type: dict[UUID, _TypeAcc] = {t.id: _TypeAcc() for t in ticket_types}
 
     # --- snapshot: sold (committed) per ticket type
-    for type_id, count in (
-        await db.execute(
+    for type_id, count in await _fetch(db, 
             select(OrderItem.ticket_type_id, func.count(OrderItem.id))
             .join(Order, Order.id == OrderItem.order_id)
             .where(*item_filter(), Order.status.in_(_COMMITTED))
             .group_by(OrderItem.ticket_type_id)
-        )
-    ).all():
+        ):
         if type_id in per_type:
             per_type[type_id].sold = int(count)
 
@@ -363,28 +368,25 @@ async def compute_analytics(
     )
     if tt_id is not None:
         hold_stmt = hold_stmt.where(InventoryHold.ticket_type_id == tt_id)
-    for type_id, quantity in (await db.execute(hold_stmt)).all():
+    for type_id, quantity in await _fetch(db, hold_stmt):
         if type_id in per_type:
             per_type[type_id].reserved = int(quantity)
 
     # --- snapshot: ticket statuses per ticket type
-    for type_id, status, count in (
-        await db.execute(
+    for type_id, status, count in await _fetch(db, 
             select(OrderItem.ticket_type_id, Ticket.status, func.count(Ticket.id))
             .join(OrderItem, OrderItem.id == Ticket.order_item_id)
             .join(Order, Order.id == OrderItem.order_id)
             .where(*item_filter())
             .group_by(OrderItem.ticket_type_id, Ticket.status)
-        )
-    ).all():
+        ):
         if type_id in per_type:
             per_type[type_id].statuses[status] = int(count)
 
     # --- period: realized sales per (currency, ticket type)
     reversed_flag = case((Order.status.in_(_REVERSED), 1), else_=0)
     currencies: dict[str, _CurrencyAcc] = defaultdict(_CurrencyAcc)
-    for currency, type_id, count, gross, discount, final, reversed_count in (
-        await db.execute(
+    for currency, type_id, count, gross, discount, final, reversed_count in await _fetch(db, 
             select(
                 Order.currency,
                 OrderItem.ticket_type_id,
@@ -401,8 +403,7 @@ async def compute_analytics(
                 *_in_range(Order.paid_at, start, end),
             )
             .group_by(Order.currency, OrderItem.ticket_type_id)
-        )
-    ).all():
+        ):
         acc = currencies[currency]
         acc.tickets_sold += int(count)
         acc.tickets_reversed += int(reversed_count)
@@ -430,17 +431,15 @@ async def compute_analytics(
         order_stmt = order_stmt.where(
             Order.id.in_(select(OrderItem.order_id).where(OrderItem.ticket_type_id == tt_id))
         )
-        for currency, orders in (await db.execute(order_stmt.group_by(Order.currency))).all():
+        for currency, orders in await _fetch(db, order_stmt.group_by(Order.currency)):
             currencies[currency].orders = int(orders)
     else:
-        for currency, orders, fees, total in (
-            await db.execute(
+        for currency, orders, fees, total in await _fetch(db, 
                 order_stmt.add_columns(
                     func.coalesce(func.sum(Order.fee_amount), 0),
                     func.coalesce(func.sum(Order.total_amount), 0),
                 ).group_by(Order.currency)
-            )
-        ).all():
+            ):
             acc = currencies[currency]
             acc.orders = int(orders)
             acc.fees = _money(fees)
@@ -454,8 +453,7 @@ async def compute_analytics(
         *_in_range(Refund.completed_at, start, end),
     ]
     if tt_id is None:
-        for currency, count, amount in (
-            await db.execute(
+        for currency, count, amount in await _fetch(db, 
                 select(
                     Refund.currency,
                     func.count(Refund.id),
@@ -464,15 +462,13 @@ async def compute_analytics(
                 .join(Order, Order.id == Refund.order_id)
                 .where(*refund_conditions)
                 .group_by(Refund.currency)
-            )
-        ).all():
+            ):
             currencies[currency].refund_count = int(count)
             currencies[currency].refunds = _money(amount)
     else:
         # Refunds are full-order, so every item of the type in a refunded
         # order was refunded at its final price.
-        for currency, count, amount in (
-            await db.execute(
+        for currency, count, amount in await _fetch(db, 
                 select(
                     Order.currency,
                     func.count(func.distinct(Refund.id)),
@@ -483,8 +479,7 @@ async def compute_analytics(
                 .join(OrderItem, OrderItem.order_id == Order.id)
                 .where(*refund_conditions, OrderItem.ticket_type_id == tt_id)
                 .group_by(Order.currency)
-            )
-        ).all():
+            ):
             currencies[currency].refund_count = int(count)
             currencies[currency].refunds = _money(amount)
 
@@ -526,7 +521,7 @@ async def compute_analytics(
                 .where(OrderItem.ticket_type_id == tt_id)
             )
         )
-    scans = {action: int(count) for action, count in (await db.execute(checkin_stmt)).all()}
+    scans = {action: int(count) for action, count in await _fetch(db, checkin_stmt)}
     admitted = int(
         await db.scalar(
             select(func.count(func.distinct(Ticket.id)))
@@ -650,10 +645,9 @@ async def _sales_over_time(
     if tt_id is not None:
         conditions.append(OrderItem.ticket_type_id == tt_id)
     buckets: dict[tuple[str, date], list[Any]] = {}
-    if db.bind.dialect.name == "postgresql":
+    if db.get_bind().dialect.name == "postgresql":
         day = sql_cast(func.timezone(tz_name, Order.paid_at), Date)
-        rows = (
-            await db.execute(
+        rows = await _fetch(db, 
                 select(
                     Order.currency, day, func.count(func.distinct(Order.id)),
                     func.count(OrderItem.id), func.coalesce(func.sum(OrderItem.unit_price), 0),
@@ -662,13 +656,11 @@ async def _sales_over_time(
                 .where(*conditions)
                 .group_by(Order.currency, day)
             )
-        ).all()
         for currency, bucket, orders, tickets, gross in rows:
             buckets[(currency, bucket)] = [int(orders), int(tickets), _money(gross)]
     else:
         tz = zone(tz_name)
-        order_rows = (
-            await db.execute(
+        order_rows = await _fetch(db, 
                 select(
                     Order.id, Order.currency, Order.paid_at,
                     func.count(OrderItem.id), func.coalesce(func.sum(OrderItem.unit_price), 0),
@@ -677,7 +669,6 @@ async def _sales_over_time(
                 .where(*conditions)
                 .group_by(Order.id, Order.currency, Order.paid_at)
             )
-        ).all()
         for _order_id, currency, paid_at, tickets, gross in order_rows:
             assert paid_at is not None
             aware = paid_at if paid_at.tzinfo else paid_at.replace(tzinfo=timezone.utc)
@@ -716,8 +707,7 @@ async def _campaign_metrics(
     campaign_ids = [c.id for c in campaigns]
 
     redemptions: dict[UUID, dict[str, int]] = defaultdict(dict)
-    for campaign_id, status, count in (
-        await db.execute(
+    for campaign_id, status, count in await _fetch(db, 
             select(
                 PromoRedemption.campaign_id,
                 PromoRedemption.status,
@@ -725,8 +715,7 @@ async def _campaign_metrics(
             )
             .where(PromoRedemption.campaign_id.in_(campaign_ids))
             .group_by(PromoRedemption.campaign_id, PromoRedemption.status)
-        )
-    ).all():
+        ):
         redemptions[campaign_id][status] = int(count)
 
     paid_in_range = [
@@ -749,7 +738,7 @@ async def _campaign_metrics(
     )
     if tt_id is not None:
         item_stmt = item_stmt.where(OrderItem.ticket_type_id == tt_id)
-    for campaign_id, currency, count, discount, final in (await db.execute(item_stmt)).all():
+    for campaign_id, currency, count, discount, final in await _fetch(db, item_stmt):
         item_rows[(campaign_id, currency)] = (int(count), _money(discount), _money(final))
 
     order_stmt = select(
@@ -763,11 +752,10 @@ async def _campaign_metrics(
         order_stmt = order_stmt.where(
             Order.id.in_(select(OrderItem.order_id).where(OrderItem.ticket_type_id == tt_id))
         )
+    grouped = await _fetch(db, order_stmt.group_by(Order.campaign_id, Order.currency))
     order_rows = {
         (campaign_id, currency): (int(orders), int(reversed_count), _money(total))
-        for campaign_id, currency, orders, reversed_count, total in (
-            await db.execute(order_stmt.group_by(Order.campaign_id, Order.currency))
-        ).all()
+        for campaign_id, currency, orders, reversed_count, total in grouped
     }
 
     result = []
@@ -908,8 +896,7 @@ async def event_history(
     }
     column = columns[sort.lstrip("-")]
     descending = sort.startswith("-")
-    rows = (
-        await db.execute(
+    rows = await _fetch(db, 
             select(Event, staff.role, sold)
             .outerjoin(staff, staff_join)
             .where(*conditions)
@@ -920,7 +907,6 @@ async def event_history(
             .limit(limit)
             .offset(offset)
         )
-    ).all()
     items = [
         EventHistoryItem(
             id=event.id,
@@ -1046,8 +1032,7 @@ async def event_timeline(
     )
     actor = aliased(User)
     ascending = order == "asc"
-    rows = (
-        await db.execute(
+    rows = await _fetch(db, 
             select(AuditLog, actor)
             .outerjoin(actor, actor.id == AuditLog.actor_user_id)
             .where(*conditions)
@@ -1058,7 +1043,6 @@ async def event_timeline(
             .limit(limit)
             .offset(offset)
         )
-    ).all()
     labels = await entity_labels(db, [row[0] for row in rows])
     items = [
         TimelineEntry(
@@ -1104,7 +1088,7 @@ async def entity_labels(db: AsyncSession, entries: list[AuditLog]) -> dict[tuple
     async def collect(kind: str, stmt: Any, fmt: Any) -> None:
         if not wanted.get(kind):
             return
-        for row in (await db.execute(stmt)).all():
+        for row in await _fetch(db, stmt):
             labels[(kind, row[0])] = fmt(*row[1:])
 
     def order_label(prefix: str) -> Any:
@@ -1163,12 +1147,10 @@ async def event_audit_entries(
         stmt = stmt.where(AuditLog.action == action)
     if action_prefix:
         stmt = stmt.where(AuditLog.action.startswith(action_prefix, autoescape=True))
-    rows = (
-        await db.execute(
+    rows = await _fetch(db, 
             stmt.order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
             .limit(limit).offset(offset)
         )
-    ).all()
     labels = await entity_labels(db, [row[0] for row in rows])
     return [
         (
