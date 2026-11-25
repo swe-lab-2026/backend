@@ -19,6 +19,7 @@ from app.schemas.organizers import (
     OrganizerProfileUpdate,
     PayoutAccountCreate,
 )
+from app.services import notifications
 
 logger = logging.getLogger("app.organizers")
 
@@ -235,6 +236,19 @@ async def set_payout_status(
         metadata={"reason": reason, "is_simulated": action.endswith("simulated")},
     )
     await db.flush()
+    if previous != status:
+        # SRS 4.10: the organizer hears about every payout status change.
+        # notify_users skips the actor, so a self-service simulation is silent.
+        await notifications.notify_users(
+            db, user_ids=[account.organizer_user_id], kind="PAYOUT_STATUS_CHANGED",
+            payload={
+                "payout_account_id": str(account.id),
+                "previous_status": previous.value,
+                "status": status.value,
+                "reason": reason,
+            },
+            exclude=[actor.id],
+        )
     return account
 
 
@@ -242,6 +256,12 @@ async def simulate_verification(db: AsyncSession, user: User) -> OrganizerProfil
     profile = await get_organizer_profile(db, user)
     if profile.verification_status == VerificationStatus.VERIFIED:
         return profile
+    if profile.verification_status == VerificationStatus.REJECTED:
+        # A demo shortcut must never overturn a Platform Admin's decision.
+        raise ApiError(
+            409, "VERIFICATION_REJECTED",
+            "Verification was rejected by a Platform Admin and cannot be simulated",
+        )
     return await set_verification_status(
         db, user, profile, VerificationStatus.VERIFIED,
         action="organizer.verification_simulated", actor_type="ORGANIZER",
@@ -252,6 +272,19 @@ async def simulate_payout_approval(db: AsyncSession, user: User) -> PayoutAccoun
     account = await get_payout_account(db, user)
     if account.status == PayoutStatus.ACTIVE:
         return account
+    # Checking every account, not just this one, stops an organizer from adding
+    # a fresh (PENDING) account to get around a block on another account.
+    blocked = await db.scalar(
+        select(PayoutAccount.id).where(
+            PayoutAccount.organizer_user_id == user.id,
+            PayoutAccount.status == PayoutStatus.BLOCKED,
+        ).limit(1)
+    )
+    if blocked is not None:
+        raise ApiError(
+            409, "PAYOUT_ACCOUNT_BLOCKED",
+            "A payout account was blocked by a Platform Admin; approval cannot be simulated",
+        )
     return await set_payout_status(
         db, user, account, PayoutStatus.ACTIVE,
         action="organizer.payout_approval_simulated", actor_type="ORGANIZER",

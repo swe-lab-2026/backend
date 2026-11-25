@@ -41,6 +41,7 @@ from app.schemas.admin import (
     AdminEventResponse,
     AdminOrderResponse,
     AdminPaymentResponse,
+    AdminPayoutAccountResponse,
     AdminReasonRequest,
     AdminRefundResponse,
     AdminUserResponse,
@@ -439,6 +440,20 @@ async def set_organizer_verification(
         reason=payload.reason,
     )
     return _profile_response(profile)
+
+
+@router.get("/payout-accounts", response_model=Page[AdminPayoutAccountResponse])
+async def list_payout_accounts(
+    status: PayoutStatus | None = None,
+    q: str | None = Query(default=None, min_length=1, max_length=200),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+) -> Page[AdminPayoutAccountResponse]:
+    """Payout accounts with their organizer, newest change first (approval queue)."""
+    return await service.list_payout_accounts(
+        db, status=status, q=q, limit=limit, offset=offset
+    )
 
 
 @router.post("/payout-accounts/{account_id}/status", response_model=PayoutAccountResponse)

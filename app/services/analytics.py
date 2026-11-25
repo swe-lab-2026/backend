@@ -938,6 +938,14 @@ async def event_history(
 # Security probes are not event activity and are kept off the timeline.
 _TIMELINE_EXCLUDED = ("event.staff_access_denied", "support_case.access_denied")
 
+# Reports are confidential: the organizer must never learn who reported their
+# event (nor see the admin's handling of it). These rows stay admin-only.
+_OWNER_HIDDEN_ENTITY_TYPES = ("event_report",)
+
+
+def _owner_visible() -> Any:
+    return AuditLog.entity_type.not_in(_OWNER_HIDDEN_ENTITY_TYPES)
+
 _DESCRIPTIONS = {
     "event.created": "Event created",
     "event.updated": "Event details updated",
@@ -1013,6 +1021,7 @@ async def event_timeline(
     conditions: list[Any] = [
         AuditLog.event_id == event.id,
         AuditLog.action.not_in(_TIMELINE_EXCLUDED),
+        _owner_visible(),
         *_in_range(AuditLog.created_at, start, end),
     ]
     if actions:
@@ -1141,7 +1150,11 @@ async def event_audit_entries(
     stmt = (
         select(AuditLog, actor)
         .outerjoin(actor, actor.id == AuditLog.actor_user_id)
-        .where(AuditLog.event_id == event.id, *_in_range(AuditLog.created_at, start, end))
+        .where(
+            AuditLog.event_id == event.id,
+            _owner_visible(),
+            *_in_range(AuditLog.created_at, start, end),
+        )
     )
     if action:
         stmt = stmt.where(AuditLog.action == action)
