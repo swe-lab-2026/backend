@@ -434,6 +434,59 @@ async def test_admin_item_fields_campaigns_and_csv_export(client, app, db):
     assert exports == 5
 
 
+async def test_csv_export_status_filter_and_truncation(client, app, db, monkeypatch):
+    from app.services import admin as admin_service
+
+    _owner, owner_token, event, ga, _vip = await _setup(client, app, db, prefix="csvst")
+    _admin_user, admin_token = await _admin(app, db, email="csvst-admin@example.com")
+    _b, token = await _buyer(app, db, "csvst-buyer@example.com")
+    kept = (await _order(client, token, event["id"], [_item(ga)])).json()
+    await _pay(client, token, kept["id"])
+    failed = (await _order(client, token, event["id"], [_item(ga)])).json()
+    await _pay(client, token, failed["id"], outcome="failed")
+
+    async def export(kind, **params):
+        response = await client.get(f"{API}/admin/export/{kind}.csv", params=params,
+                                    headers=bearer(admin_token))
+        return response, list(csv.reader(io.StringIO(response.text)))
+
+    for kind, status, present, absent in (
+        ("orders", "PAID", kept["id"], failed["id"]),
+        ("payments", "FAILED", failed["id"], kept["id"]),
+        ("payments", "SUCCEEDED", kept["id"], failed["id"]),
+        ("events", "PUBLISHED", event["id"], None),
+        ("users", "ACTIVE", "csvst-buyer@example.com", None),
+    ):
+        response, rows = await export(kind, status=status)
+        assert response.status_code == 200, (kind, status, response.text)
+        assert response.headers["x-truncated"] == "false"
+        assert response.headers["x-total-count"] == str(len(rows) - 1)
+        status_col = rows[0].index("status")
+        assert {row[status_col] for row in rows[1:]} == {status}
+        assert present in response.text
+        if absent is not None:
+            assert absent not in response.text
+    # Statuses that match nothing give a header-only file.
+    _response, rows = await export("events", status="CANCELLED")
+    assert rows == [admin_service.EXPORT_COLUMNS["events"]]
+    _response, rows = await export("users", status="BLOCKED", q="csvst-buyer")
+    assert len(rows) == 1
+
+    bad, _rows = await export("orders", status="SHIPPED")
+    assert bad.status_code == 422
+    assert "PAID" in bad.json()["error"]["details"]["allowed"]
+    assert (await export("users", status="PAID"))[0].status_code == 422
+
+    # The row limit is reported instead of silently cutting the file.
+    monkeypatch.setattr(admin_service, "EXPORT_MAX_ROWS", 1)
+    response, rows = await export("orders")
+    assert response.headers["x-truncated"] == "true"
+    assert response.headers["x-total-count"] == "1" and len(rows) == 2
+    response, rows = await export("orders", status="PAID")
+    assert response.headers["x-truncated"] == "false" and len(rows) == 2
+    del owner_token
+
+
 async def test_csv_cells_are_formula_safe():
     from app.services.admin import _csv_cell
 

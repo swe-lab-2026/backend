@@ -1155,46 +1155,56 @@ EXPORT_COLUMNS: dict[str, list[str]] = {
 }
 
 
-async def export_rows(db: AsyncSession, kind: str, *, q: str | None) -> list[list[str]]:
-    """Rows for ``/admin/export/{kind}.csv`` (header first), newest first.
+async def export_rows(
+    db: AsyncSession, kind: str, *, q: str | None, status: Any = None
+) -> tuple[list[list[str]], bool]:
+    """Rows for ``/admin/export/{kind}.csv`` (header first), newest first, and
+    whether the ``EXPORT_MAX_ROWS`` limit cut the result.
 
-    Reuses the search functions in pages, so filters and redaction match the
-    JSON listings (no password hashes, tokens or account references).
+    Reuses the search functions in pages, so filters (``q``, ``status``) and
+    redaction match the JSON listings (no password hashes, tokens or account
+    references). ``status`` must already be the enum of the listed kind.
     """
     rows: list[list[str]] = [EXPORT_COLUMNS[kind]]
     page_size = 100
     offset = 0
+    total = 0
     while offset < EXPORT_MAX_ROWS:
         values: list[list[Any]]
         if kind == "users":
-            page_u = await search_users(db, q=q, status=None, role=None, is_organizer=None,
+            page_u = await search_users(db, q=q, status=status, role=None, is_organizer=None,
                                         sort="-created_at", limit=page_size, offset=offset)
             values = [[u.id, u.email, u.name, u.global_role, u.status, u.is_organizer,
                        u.email_verified_at, u.suspended_at, u.created_at] for u in page_u.items]
+            total = page_u.total
         elif kind == "events":
-            page_e = await search_events(db, q=q, status=None, suspended=None,
+            page_e = await search_events(db, q=q, status=status, suspended=None,
                                          owner_user_id=None, starts_from=None, starts_to=None,
                                          sort="-created_at", limit=page_size, offset=offset)
             values = [[e.id, e.title, e.owner_user_id, e.owner.name if e.owner else None,
                        e.status, e.is_suspended, e.starts_at, e.ends_at, e.city, e.capacity,
                        e.created_at] for e in page_e.items]
+            total = page_e.total
         elif kind == "orders":
-            page_o = await search_orders(db, q=q, status=None, event_id=None, buyer_user_id=None,
+            page_o = await search_orders(db, q=q, status=status, event_id=None, buyer_user_id=None,
                                          created_from=None, created_to=None, sort="-created_at",
                                          limit=page_size, offset=offset)
             values = [[o.id, o.order_number, o.event_id, o.event_title, o.buyer_email, o.status,
                        o.currency, o.subtotal_amount, o.discount_amount, o.fee_amount,
                        o.total_amount, o.promo_code, o.paid_at, o.created_at]
                       for o in page_o.items]
+            total = page_o.total
         else:
-            page_p = await search_payments(db, q=q, status=None, provider=None, order_id=None,
+            page_p = await search_payments(db, q=q, status=status, provider=None, order_id=None,
                                            event_id=None, created_from=None, created_to=None,
                                            sort="-created_at", limit=page_size, offset=offset)
             values = [[p.id, p.order_id, p.order_number, p.event_id, p.provider, p.amount,
                        p.currency, p.status, p.failure_code, p.is_simulated, p.paid_at,
                        p.created_at] for p in page_p.items]
+            total = page_p.total
         rows.extend([[_csv_cell(v) for v in row] for row in values])
         if len(values) < page_size:
             break
         offset += page_size
-    return rows[: EXPORT_MAX_ROWS + 1]
+    truncated = total > EXPORT_MAX_ROWS or len(rows) - 1 > EXPORT_MAX_ROWS
+    return rows[: EXPORT_MAX_ROWS + 1], truncated
