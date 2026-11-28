@@ -1,23 +1,104 @@
-# BiletFlow — архитектура backend
+# BiletFlow — backend
 
-## 1. Назначение документа
+BiletFlow is a student project: a platform for creating events, selling and issuing
+tickets, managing orders and checking QR codes at the door. This repository is the
+REST API that the [web app](https://github.com/swe-lab-2026/frontend) and the
+[mobile app](https://github.com/swe-lab-2026/mobile) both use.
 
-Этот документ описывает backend-архитектуру учебного проекта BiletFlow — платформы для создания мероприятий, продажи и выдачи билетов, управления заказами и проверки QR-кодов на входе.
+**Stack:** Python 3.10+, FastAPI, SQLAlchemy (async, `asyncpg`), PostgreSQL 17,
+Redis 8 (optional locally), Pydantic settings, Brevo for email, Docker Compose.
+FastAPI generates the OpenAPI docs at `/docs` and `/openapi.json`.
 
-Зафиксированный стек проекта:
+## Quick start
 
-- **Backend:** Python + FastAPI;
-- **Web frontend:** Next.js;
-- **Mobile:** React Native;
-- **Database:** PostgreSQL;
-- **API:** REST/JSON;
-- **Документация API:** OpenAPI, автоматически формируемая FastAPI.
+### Local (Python)
 
-На этапе Academic MVP используется **модульный монолит**. Все backend-модули работают в одном FastAPI-приложении и одной PostgreSQL-базе, но код разделён по бизнес-областям. Для учебной команды это проще микросервисов, а при росте проекта отдельные модули можно вынести в самостоятельные сервисы.
+```bash
+cp .env.example .env          # set JWT_ACCESS_SECRET, JWT_REFRESH_SECRET, TICKET_QR_SECRET
+make install                  # pip install -e ".[dev]"
+make infra                    # docker compose up -d postgres redis (or use your own PostgreSQL)
+make migrate                  # apply sql/migrate_*.sql (also runs on startup)
+make run                      # uvicorn on http://localhost:8000
+```
+
+With `EMAIL_PROVIDER=dev` (the default) no email is sent: verification codes and
+reset links are written to the log (`verification code for <email>: 123456`).
+
+### Docker Compose
+
+```bash
+cp .env.example .env          # also set POSTGRES_PASSWORD
+docker compose up -d --build  # postgres + redis + api on http://localhost:8000
+```
+
+The `api` container's health check calls `/health/ready`. Uploaded images are
+kept in the `media_data` volume.
+
+### First Platform Admin
+
+There is no HTTP route that creates a `PLATFORM_ADMIN`. Register and verify an
+account through the API, then run `make admin EMAIL=you@example.com`
+(in Docker: `docker compose exec api python -m app.db.bootstrap_admin --email ...`).
+
+### Make targets
+
+| Command | What it does |
+|---|---|
+| `make install` | Install the package with dev tools (pytest, ruff, mypy) |
+| `make infra` | Start PostgreSQL and Redis in Docker |
+| `make run` | Run the API with auto-reload on port 8000 |
+| `make migrate` | Apply versioned SQL migrations to `DATABASE_URL` |
+| `make admin EMAIL=...` | Promote a verified account to `PLATFORM_ADMIN` |
+| `make lint` / `make typecheck` / `make test` | ruff, mypy, pytest |
+| `make check` | lint + typecheck + test |
+
+## Implemented features
+
+| Area | What works |
+|---|---|
+| Auth | Email + password registration, 6-digit email verification code (resend with cooldown and hourly limit), login with lockout after failed attempts, rotating refresh tokens with reuse detection, logout, log out of all sessions, password reset by email link or token |
+| Users | Own profile, interface/email language (`en`, `ru`, `kk`), in-app notifications with read state, own event reports |
+| Organizers | Organizer profile, verification status, demo payout account (masked reference), own events list, organizer-wide analytics, demo self-verification and payout approval |
+| Events | Draft → publish / unpublish → cancel → completed lifecycle, edit, delete draft, duplicate, publish checklist preview, public catalog, timezones, image upload, `.ics` calendar export, activity timeline, audit log, event reports |
+| Event staff | Event-scoped `EVENT_ADMIN` / `CHECK_IN_STAFF` assignment by email, "assigned events" list with caller-specific `can_reverse_check_in` |
+| Ticket types & inventory | Create / edit / delete ticket types, price, capacity, per-order limits, sale window, hidden types, event-level capacity, live availability, transactional holds |
+| Orders | Free registration (instant `PAID`, 0.00 KZT), paid orders with a 10-minute reservation, named attendees per ticket, processing fee, automatic expiry of unpaid orders |
+| Paid sales | Per-event activation checklist, terms, demo activation fee, simulated payments (success / failed / abandoned), idempotent confirmation |
+| Tickets | One ticket per attendee, signed QR payload (only its hash is stored), ticket list, ticket details, PDF download, tickets sent by email |
+| Check-in | QR validation and check-in, manual check-in by ticket id, reverse check-in, server-side attendee search, attendance stats, machine-readable `admission_status`, row locking against double entry |
+| Campaigns | Promo codes (percent / fixed), validity window, redemption limit, ticket-type scope, server-side quote, campaign QR codes (PNG) that redirect to the event page, per-campaign analytics |
+| Refunds | Event refund policy, refund eligibility, buyer cancellation / refund, organizer full refund, refunds of a cancelled event in batches, simulated refunds |
+| Notifications | Brevo email with retries and an outbox; localized templates for verification, password reset, order confirmation, failed payment, event change / cancellation and refunds; in-app notifications |
+| Support | Support cases with event / order / ticket context, messages with polling, assignment, status changes, escalation to Platform Admins, activity log |
+| Administration | Users, events, orders, payments, paid-sales activations, refunds, failures, escalated support, campaigns, disputes, payout accounts, organizer verification, reports, platform fees, admin action log, suspensions, server-side CSV export |
+| Analytics | Event KPIs, revenue, sales over time, attendance, campaign performance, organizer totals |
+| Operations | `/health/live`, `/health/ready`, request logging, CI (lint, typecheck, tests on SQLite and PostgreSQL 17), SSH deploy of verified `main` commits |
+
+The sections below describe the architecture first and then each feature in detail.
 
 ---
 
-## 2. Общая схема системы
+## 1. Purpose of this document
+
+This document describes the backend architecture of BiletFlow.
+
+Project stack:
+
+- **Backend:** Python + FastAPI;
+- **Web frontend:** Next.js;
+- **Mobile:** React Native (Expo);
+- **Database:** PostgreSQL;
+- **API:** REST/JSON;
+- **API documentation:** OpenAPI, generated automatically by FastAPI.
+
+The Academic MVP is a **modular monolith**. All backend modules run inside one
+FastAPI application and one PostgreSQL database, but the code is split by
+business area. For a student team this is simpler than microservices, and
+individual modules can still be moved into separate services later.
+
+---
+
+## 2. System overview
 
 ```mermaid
 flowchart TD
@@ -25,48 +106,55 @@ flowchart TD
     MOBILE[React Native App]
     API[FastAPI REST API]
     DB[(PostgreSQL)]
-    EMAIL[Email provider]
-    PAY[Payment provider or simulator]
-    FILES[File storage]
+    KV[(Redis)]
+    EMAIL[Brevo email]
+    PAY[Payment simulator]
+    FILES[Media storage]
 
     WEB -->|HTTPS + JSON| API
     MOBILE -->|HTTPS + JSON| API
     API -->|SQL transactions| DB
+    API -->|Codes, rate limits| KV
     API -->|Verification and tickets| EMAIL
-    API -->|Payment request and webhook| PAY
+    API -->|Simulated payments| PAY
     API -->|Event images| FILES
 ```
 
-FastAPI является единственной точкой доступа к данным. Next.js и React Native не подключаются к PostgreSQL напрямую.
+FastAPI is the only way to reach the data. Next.js and React Native never
+connect to PostgreSQL directly.
+
+Redis holds short-lived data only: email-code challenges, rate limits and daily
+counters (`app/kv/store.py`). When `REDIS_URL` is empty an in-process store is
+used, so local development and tests need no extra infrastructure.
 
 ---
 
-## 3. Архитектурный стиль
+## 3. Architectural style
 
-### 3.1. Модульный монолит
+### 3.1. Modular monolith
 
-Каждый бизнес-модуль содержит собственные API-маршруты, схемы запросов и ответов, бизнес-логику и операции с базой данных. При этом все модули запускаются как одно приложение.
+Each business module has its own API routes, request/response schemas,
+business logic and database access, but all modules run as one application.
 
-Основные преимущества для BiletFlow:
+Main benefits for BiletFlow:
 
-- единый репозиторий и простой локальный запуск;
-- общая транзакция PostgreSQL для заказа, оплаты и выдачи билетов;
-- меньше инфраструктуры и DevOps-работы;
-- понятное распределение задач между участниками команды;
-- возможность позже выделить Payments, Notifications или Check-in в отдельный сервис.
+- one repository and a simple local setup;
+- one PostgreSQL transaction for an order, its payment and its tickets;
+- less infrastructure and DevOps work;
+- a clear split of work between team members;
+- Payments, Notifications or Check-in can be moved into a separate service later.
 
-### 3.2. Слои backend
+### 3.2. Backend layers
 
-Внутри каждого модуля используются четыре логических слоя:
+| Layer | Responsibility | Location |
+|---|---|---|
+| API | HTTP routes, parameters, DTOs, status codes | `app/api/routes/*`, `app/schemas/*` |
+| Service | Business rules and use cases | `app/services/*` |
+| Repository | PostgreSQL queries and transactions | `app/db/repositories.py` |
+| Model | Tables, entities and data constraints | `app/db/models.py`, `sql/*` |
 
-| Слой | Ответственность |
-|---|---|
-| API | HTTP-маршруты, параметры, DTO, коды ответа |
-| Service | Бизнес-правила и сценарии использования |
-| Repository | Запросы и транзакции PostgreSQL |
-| Model | Таблицы, сущности и ограничения данных |
-
-Контроллер API не должен самостоятельно выполнять сложные SQL-запросы или рассчитывать остатки билетов. Он проверяет входные данные, вызывает service и преобразует результат в HTTP-ответ.
+An API route does not run complex SQL or compute ticket availability itself. It
+validates the input, calls a service and turns the result into an HTTP response.
 
 ```mermaid
 flowchart LR
@@ -77,111 +165,102 @@ flowchart LR
 
 ---
 
-## 4. Структура backend-проекта
+## 4. Project structure
 
 ```text
 backend/
 ├── app/
-│   ├── main.py
-│   ├── config.py
-│   ├── database.py
+│   ├── main.py               app factory, routers, health checks, background loops
 │   ├── api/
-│   │   ├── dependencies.py
-│   │   └── v1/
-│   │       └── router.py
-│   ├── core/
-│   │   ├── exceptions.py
-│   │   ├── security.py
-│   │   ├── permissions.py
-│   │   └── logging.py
-│   ├── modules/
-│   │   ├── auth/
-│   │   │   ├── router.py
-│   │   │   ├── schemas.py
-│   │   │   ├── service.py
-│   │   │   ├── repository.py
-│   │   │   └── models.py
-│   │   ├── users/
-│   │   ├── organizers/
-│   │   ├── events/
-│   │   ├── ticket_types/
-│   │   ├── campaigns/
-│   │   ├── inventory/
-│   │   ├── orders/
-│   │   ├── payments/
-│   │   ├── tickets/
-│   │   ├── checkin/
-│   │   ├── notifications/
-│   │   ├── support/
-│   │   └── audit/
-│   └── integrations/
-│       ├── email.py
-│       ├── payments.py
-│       └── file_storage.py
-├── migrations/
-├── tests/
-│   ├── unit/
-│   ├── integration/
-│   └── e2e/
-├── .env.example
+│   │   ├── deps.py           auth and permission dependencies
+│   │   └── routes/           auth, users, organizers, events, campaigns, orders,
+│   │                         tickets (+ check-in), support, admin, media
+│   ├── core/                 config, errors, logging, security (hashing, JWT)
+│   ├── db/                   models, repositories, session, schema, migrate,
+│   │                         bootstrap_admin
+│   ├── kv/                   TTL key-value store (Redis or in-process)
+│   ├── schemas/              Pydantic request/response models per module
+│   └── services/             business logic: auth, events, inventory, orders,
+│                             paid_sales, tickets, pdf_tickets, campaigns, refunds,
+│                             notifications, email, email_templates, support,
+│                             reports, analytics, admin, platform_settings,
+│                             media, calendar, organizers, event_staff, ticket_types
+├── sql/                      versioned migrations migrate_001 … migrate_011
+├── tests/                    pytest suite (SQLite by default, PostgreSQL in CI)
+├── scripts/                  benchmark_qr_validation.py
+├── .github/workflows/        ci.yml, deploy.yml
+├── docker-compose.yml        postgres, redis, api
 ├── Dockerfile
-└── requirements.txt
+├── Makefile
+└── pyproject.toml
 ```
 
-Внутри модуля разрешены зависимости на общий `core`, соединение с базой и публичные сервисы других модулей. Прямое изменение таблиц другого модуля следует выполнять только через его service либо явно согласованный repository-сценарий.
+A service may use `core`, the database session and the public functions of
+other services. Tables that belong to another module are changed only through
+that module's service or an agreed repository function.
 
 ---
 
-## 5. Backend-модули
+## 5. Backend modules
 
 ### 5.1. Auth
 
-Отвечает за:
+Responsible for:
 
-- регистрацию по email и паролю;
-- подтверждение email;
-- вход и выход;
-- access- и refresh-токены;
-- обновление access-токена;
-- восстановление пароля;
-- завершение всех активных сессий;
-- ограничение числа неудачных попыток входа.
+- registration with email and password;
+- email verification;
+- login and logout;
+- access and refresh tokens;
+- refreshing the access token;
+- password reset;
+- ending all active sessions;
+- limiting failed login attempts.
 
 ### 5.2. Users
 
-Отвечает за профиль пользователя, контактные данные, язык интерфейса, статус аккаунта и глобальную роль.
+User profile, contact details, interface language, account status and global role.
 
 ### 5.3. Organizers
 
-Создаёт профиль организатора, хранит реквизиты и статус проверки. Один пользователь может быть обычным покупателем и одновременно организатором.
+Creates the organizer profile and stores its details and verification status.
+One user can be a regular buyer and an organizer at the same time.
 
 ### 5.4. Events
 
-Управляет созданием, редактированием, публикацией и отменой мероприятий, их описанием, местом, временем, изображениями и персоналом.
+Creating, editing, publishing and cancelling events, together with their
+description, venue, time, images and staff.
 
-### 5.5. Ticket Types и Inventory
+### 5.5. Ticket types and inventory
 
-Управляет категориями билетов, ценой, лимитами и остатком. Остаток не хранится отдельным изменяемым числом:
+Ticket categories, price, limits and remaining stock. Remaining stock is not
+stored as a separate mutable number:
 
 ```text
 available = capacity - sold - active_holds
 ```
 
-Общий лимит мероприятия (`events.capacity`) ограничивает все типы сразу. В
-`GET /api/v1/events/{event_id}/inventory` для каждого типа: `type_remaining` —
-остаток по лимиту самого типа, `available` — сколько можно продать сейчас
-(`type_remaining`, но не больше остатка мероприятия; совпадает с публичным
-`GET /ticket-types`). `event_remaining = event.capacity − sold − active_holds`
-(`null`, если лимита нет), `total_available = min(Σ type_remaining,
-event_remaining)`.
+The event-wide limit (`events.capacity`) caps all ticket types together. In
+`GET /api/v1/events/{event_id}/inventory` each type has `type_remaining` (what
+is left under the type's own limit) and `available` (what can be sold right now:
+`type_remaining`, but no more than what is left for the event; the same value as
+the public `GET /ticket-types`). `event_remaining = event.capacity − sold −
+active_holds` (`null` when there is no limit), and `total_available =
+min(Σ type_remaining, event_remaining)`.
 
-Резерв билетов создаётся на ограниченное время во время checkout. После оплаты резерв превращается в проданные билеты; после истечения времени — освобождается.
+A hold is created for a limited time during checkout. After payment the hold
+becomes sold tickets; when it expires, it is released.
 
 ### 5.6. Orders
 
-Создаёт заказ и позиции билетов, связывает покупателя с участником и контролирует срок checkout. При создании заказа количество билетов резервируется транзакционно на 10 минут; после истечения срока заказ становится `EXPIRED`, а резерв освобождается. Бесплатная регистрация сразу создаёт подтверждённый заказ со статусом `PAID`, суммой `0.00 KZT` и билетами — платёжные данные не нужны. Организатор видит только регистрации из подтверждённых заказов через `GET /api/v1/events/{event_id}/attendees`.
+Creates the order and its items, links the buyer to the attendees and enforces
+the checkout deadline. Creating an order reserves the tickets in one transaction
+for 10 minutes (`ORDER_RESERVATION_TTL_MINUTES`); when the time runs out a
+background loop marks the order `EXPIRED` and releases the hold. A free
+registration immediately creates a confirmed `PAID` order for `0.00 KZT` with
+tickets — no payment details are needed. The organizer sees only registrations
+from confirmed orders through `GET /api/v1/events/{event_id}/attendees`.
 
-Основные статусы:
+Main statuses:
 
 ```text
 PENDING -> PAID
@@ -193,93 +272,141 @@ PAID/PARTIALLY_REFUNDED -> REFUNDED
 
 ### 5.7. Payments
 
-Содержит единый интерфейс для платёжного провайдера. Для лабораторной работы может использоваться симулятор оплаты, но доменная логика должна выглядеть так же, как при реальной интеграции.
+One interface for the payment provider. The MVP uses a payment simulator
+(see [Paid ticket sales](#paid-ticket-sales-demo-payment-simulation)), but the
+domain logic works the same way it would with a real provider.
 
-Критичные требования:
+Key rules:
 
-- повторный webhook не должен повторно выдавать билеты;
-- каждому платёжному запросу назначается idempotency key;
-- подтверждение оплаты выполняется одной транзакцией;
-- финансовые записи не удаляются физически.
+- a repeated payment result never issues tickets twice;
+- every simulated payment is unique per order (unique index + row lock);
+- payment confirmation runs in a single transaction;
+- financial records are never physically deleted.
 
 ### 5.8. Tickets
 
-После успешной оплаты создаёт по одной записи `ticket` для каждого `order_item`. QR-код содержит случайный непрозрачный токен. В базе хранится только его криптографический хеш.
+After a successful payment one `ticket` row is created per attendee. The QR
+code holds a signed payload (`v1.<public_id>.<HMAC-SHA256>` signed with
+`TICKET_QR_SECRET`); the database stores only its SHA-256 hash. The payload is
+deterministic, so a regenerated PDF always shows the same QR code.
+
+Endpoints: `GET /tickets` (own tickets), `GET /tickets/{public_id}`,
+`GET /tickets/{public_id}/pdf` and `/download` (PDF ticket), and
+`GET /orders/{order_id}/tickets`.
 
 ### 5.9. Check-in
 
-Проверяет QR-код, принадлежность билета мероприятию и его статус. Двойной проход предотвращается блокировкой строки билета внутри транзакции.
+Checks the QR code, that the ticket belongs to the event and its status. A
+double entry is prevented by locking the ticket row inside the transaction.
 
-Каждый отказ при проходе содержит машиночитаемое поле
-`error.details.admission_status`. Коды ошибок не изменились, поэтому старые
-клиенты, которые обрабатывают `TICKET_NOT_VALID`, продолжают работать.
-`POST .../tickets/validate` возвращает то же значение в `admission_status`.
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/events/{event_id}/check-in` | Scan a QR payload and admit (aliases: `/checkin`, `/tickets/check-in`) |
+| `POST` | `/events/{event_id}/tickets/validate` | Check a QR payload without admitting (alias: `/validate`) |
+| `POST` | `/events/{event_id}/tickets/{public_id}/check-in` | Manual check-in by ticket id |
+| `POST` | `/events/{event_id}/tickets/{public_id}/reverse-check-in` | Undo a check-in (owner, `PLATFORM_ADMIN`, `EVENT_ADMIN`; not `CHECK_IN_STAFF`) |
+| `GET` | `/events/{event_id}/tickets/search?q=` | Search attendees by name, email, ticket id or order number (non-empty `q`, paginated; alias: `/attendees/search`) |
+| `GET` | `/events/{event_id}/tickets/stats` | Attendance counters |
 
-| Ситуация | HTTP | `error.code` | `admission_status` |
+All of them require owner, `PLATFORM_ADMIN` or assigned event staff access.
+
+Every rejected admission has a machine-readable `error.details.admission_status`.
+Error codes did not change, so older clients that handle `TICKET_NOT_VALID`
+keep working. `POST .../tickets/validate` returns the same value in
+`admission_status`.
+
+| Case | HTTP | `error.code` | `admission_status` |
 |---|---|---|---|
-| Пропуск выполнен | 200 | — | (ответ — билет) |
-| Подделанный/неизвестный QR | 401 | `INVALID_TICKET_QR` | `INVALID_QR` |
-| QR кампании | 400 | `CAMPAIGN_QR_NOT_ADMISSION` | `CAMPAIGN_QR` |
-| Билет не найден | 404 | `TICKET_NOT_FOUND` | `NOT_FOUND` |
-| Билет другого мероприятия | 404 | `TICKET_NOT_FOUND` | `WRONG_EVENT` |
-| Повторное сканирование | 409 | `TICKET_ALREADY_CHECKED_IN` | `ALREADY_CHECKED_IN` (+ `checked_in_at`) |
-| Билет отменён | 409 | `TICKET_NOT_VALID` | `CANCELLED` |
-| Билет возвращён | 409 | `TICKET_NOT_VALID` | `REFUNDED` |
-| Отмена прохода для не отмеченного билета | 409 | `TICKET_NOT_CHECKED_IN` | `NOT_CHECKED_IN` |
+| Admitted | 200 | — | (response is the ticket) |
+| Forged / unknown QR | 401 | `INVALID_TICKET_QR` | `INVALID_QR` |
+| Campaign QR | 400 | `CAMPAIGN_QR_NOT_ADMISSION` | `CAMPAIGN_QR` |
+| Ticket not found | 404 | `TICKET_NOT_FOUND` | `NOT_FOUND` |
+| Ticket for another event | 404 | `TICKET_NOT_FOUND` | `WRONG_EVENT` |
+| Scanned again | 409 | `TICKET_ALREADY_CHECKED_IN` | `ALREADY_CHECKED_IN` (+ `checked_in_at`) |
+| Ticket cancelled | 409 | `TICKET_NOT_VALID` | `CANCELLED` |
+| Ticket refunded | 409 | `TICKET_NOT_VALID` | `REFUNDED` |
+| Reversing a ticket that is not checked in | 409 | `TICKET_NOT_CHECKED_IN` | `NOT_CHECKED_IN` |
 
-Мобильному клиенту следует сначала смотреть `admission_status`, а `error.code`
-использовать как запасной вариант.
+The mobile client reads `admission_status` first and falls back to `error.code`.
 
 ### 5.10. Campaigns
 
-Управляет промокодами, реферальными ссылками, периодом действия, лимитом использований и применимостью к типам билетов.
+Promo codes, campaign links, validity period, redemption limit and the ticket
+types a campaign applies to.
 
-Реализовано в SCRUM-15 — см. раздел [Promo-code campaigns and campaign QR codes](#promo-code-campaigns-and-campaign-qr-codes-scrum-15).
+Implemented in SCRUM-15 — see
+[Promo-code campaigns and campaign QR codes](#promo-code-campaigns-and-campaign-qr-codes-scrum-15).
 
 ### 5.11. Notifications
 
-Отвечает за подтверждение email, восстановление пароля, отправку билета и уведомления об изменениях мероприятия.
+Email verification, password reset, ticket delivery and event change notices.
 
-- В development/test используется log-only `DevEmailProvider`; реальная отправка не выполняется.
-- В production обязателен `EMAIL_PROVIDER=brevo`. Backend не запустится с dev-провайдером, без `BREVO_API_KEY` или с невалидным sender email.
-- Brevo вызывается напрямую через `httpx` (`POST /v3/smtp/email`), без отдельной очереди. HTTP-клиент создаётся один раз в lifespan.
-- Подтверждение заказа хранится в outbox `order_notifications` с уникальностью `(order_id, kind)`, поэтому повторный confirm не создаёт дубль письма и не выдаёт новые билеты.
-- Временные ошибки Brevo (429, 5xx, timeout) повторяются с exponential backoff и учётом `Retry-After`; постоянные ошибки (400/401/403, невалидный адрес) помечаются `permanent:` и больше не повторяются.
-- API-ключи, коды подтверждения, reset-токены и содержимое писем не логируются.
-- Письмо сброса пароля содержит кнопку со ссылкой `{PASSWORD_RESET_URL}?token=...&email=...` (по умолчанию `PASSWORD_RESET_URL = {PUBLIC_WEB_BASE_URL}/reset-password`). Это может быть https-страница веб-клиента (мобильное приложение может перехватывать её как App Link / Universal Link) или deep link приложения, например `biletflow://reset-password`. Клиент читает `token` и `email` из ссылки и отправляет их с новым паролем в `POST /auth/reset-password`. Если ни одна из настроек не задана, письмо показывает токен, как раньше.
-- Язык писем берётся из `users.locale`: `en` (по умолчанию), `ru` или `kk`. Он задаётся при регистрации (`locale` в `POST /auth/register`) и через `PATCH /users/me`; другие значения дают `422`. Шаблоны верификации, сброса пароля, подтверждения заказа, неудачной оплаты, изменения/отмены мероприятия и возврата есть на всех трёх языках; если строки нет, используется английский. Гостевые заказы получают письма на английском. Тексты из payload (например `notice` у возврата) и названия изменённых полей пока остаются на английском.
+- In development/test the log-only `DevEmailProvider` is used; nothing is sent.
+- In production `EMAIL_PROVIDER=brevo` is required. The backend refuses to start
+  with the dev provider, without `BREVO_API_KEY` or with an invalid sender email.
+- Brevo is called directly with `httpx` (`POST /v3/smtp/email`), without a
+  separate queue. The HTTP client is created once in the app lifespan.
+- The order confirmation is stored in the `order_notifications` outbox, unique by
+  `(order_id, kind)`, so a repeated confirm neither sends a second email nor
+  issues new tickets.
+- Temporary Brevo errors (429, 5xx, timeout) are retried with exponential
+  backoff and respect `Retry-After`; permanent errors (400/401/403, invalid
+  address) are marked `permanent:` and not retried.
+- API keys, verification codes, reset tokens and email bodies are never logged.
+- The password reset email has a button linking to
+  `{PASSWORD_RESET_URL}?token=...&email=...` (by default
+  `PASSWORD_RESET_URL = {PUBLIC_WEB_BASE_URL}/reset-password`). This can be an
+  https page of the web client (the mobile app can intercept it as an App Link /
+  Universal Link) or an app deep link such as `biletflow://reset-password`. The
+  client reads `token` and `email` from the link and sends them with the new
+  password to `POST /auth/reset-password`. When neither setting is set, the email
+  shows the token instead.
+- The email language comes from `users.locale`: `en` (default), `ru` or `kk`. It
+  is set at registration (`locale` in `POST /auth/register`) and through
+  `PATCH /users/me`; other values return `422`. Templates for verification,
+  password reset, order confirmation, failed payment, event change/cancellation
+  and refund exist in all three languages; missing strings fall back to English.
+  Guest orders get English emails. Payload texts (for example a refund `notice`)
+  and changed field names are still in English.
+- In-app notifications: `GET /users/me/notifications` and
+  `POST /users/me/notifications/{notification_id}/read`.
 
-### 5.12. Support и Audit
+### 5.12. Support and audit
 
-Support хранит обращения пользователей. Audit фиксирует важные действия: публикацию события, изменение цены, возврат, check-in, изменение ролей и блокировку пользователя.
+Support stores user cases (see
+[Support cases](#support-cases-and-asynchronous-messages-scrum-16)). The audit
+log records important actions: publishing an event, price changes, refunds,
+check-ins, role changes and user suspensions.
 
 ---
 
 ## 6. API
 
-Все маршруты имеют префикс:
+All routes use the prefix:
 
 ```text
 /api/v1
 ```
 
-Пример группировки endpoints:
+Endpoint groups (full list in the [endpoint reference](#endpoint-reference)):
 
-| Модуль | Основные endpoints |
+| Module | Main endpoints |
 |---|---|
-| Auth | `/auth/register`, `/auth/verify-email`, `/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/resend-verification`, `/auth/logout-all`, `/auth/request-password-reset`, `/auth/reset-password` |
-| Users | `/users/me` |
-| Organizers | `/organizers/me`, `/organizers/me/payout-account` |
-| Events | `/events/assigned`, `/events/{event_id}/admins`, `/events/{event_id}/admins/{user_id}`, `/events/{event_id}/attendees` |
+| Auth | `/auth/register`, `/auth/verify-email`, `/auth/resend-verification`, `/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/logout-all`, `/auth/request-password-reset`, `/auth/reset-password` |
+| Users | `/users/me`, `/users/me/notifications`, `/users/me/reports` |
+| Organizers | `/organizers/me`, `/organizers/me/payout-account`, `/organizers/me/events`, `/organizers/me/analytics` |
+| Events | `/events`, `/events/catalog`, `/events/assigned`, `/events/{event_id}` and its sub-resources (admins, attendees, inventory, analytics, timeline, refund policy, paid sales, images, calendar, reports) |
 | Ticket types | `/events/{event_id}/ticket-types` |
 | Campaigns | `/events/{event_id}/campaigns`, `/events/{event_id}/campaigns/analytics`, `/campaigns/validate`, `/campaigns/qr/{campaign_token}` |
-| Orders | `/orders`, `/orders/{order_id}` |
-| Payments | `/payments`, `/payments/webhook` |
-| Tickets | `/tickets`, `/tickets/{public_id}` |
-| Check-in | `/events/{event_id}/check-in` |
+| Orders and payments | `/orders`, `/orders/{order_id}`, `/orders/{order_id}/payments/simulate`, `/orders/payments/{payment_id}/simulate-result` |
+| Refunds | `/orders/{order_id}/cancel`, `/orders/{order_id}/refund`, `/orders/{order_id}/refunds`, `/orders/{order_id}/refund-eligibility` |
+| Tickets | `/tickets`, `/tickets/{public_id}`, `/tickets/{public_id}/pdf` |
+| Check-in | `/events/{event_id}/check-in`, `/events/{event_id}/tickets/...` |
 | Support | `/support/cases`, `/support/cases/{case_id}/messages` |
+| Admin | `/admin/...` |
+| Media | `/media/{key}` |
 
-### 6.1. Формат успешного ответа
+### 6.1. Success response
 
 ```json
 {
@@ -290,7 +417,7 @@ Support хранит обращения пользователей. Audit фик
 }
 ```
 
-### 6.2. Формат ошибки
+### 6.2. Error response
 
 ```json
 {
@@ -302,21 +429,21 @@ Support хранит обращения пользователей. Audit фик
 }
 ```
 
-Для клиента важен стабильный `error.code`; текст `message` может переводиться или меняться.
+Clients rely on the stable `error.code`; the `message` text may be translated or
+changed. Validation errors use `VALIDATION_ERROR` with per-field details.
 
 ---
 
-## 7. Authentication и authorization
+## 7. Authentication and authorization
 
-### 7.1. Выбранный вариант для MVP
+### 7.1. Chosen approach for the MVP
 
-Основной способ входа:
+> **Email + password, with mandatory email verification by a one-time code.**
 
-> **Email + password, с обязательным подтверждением email одноразовым кодом.**
+OAuth2, SMS login and corporate SSO are not part of the MVP. They can be added
+later without changing the user model.
 
-OAuth2, SMS-вход и корпоративный SSO не входят в первый MVP. Их можно добавить позже, не меняя основную модель пользователей.
-
-### 7.2. Регистрация
+### 7.2. Registration
 
 ```mermaid
 sequenceDiagram
@@ -335,58 +462,64 @@ sequenceDiagram
     A-->>C: Account verified
 ```
 
-Пароль хешируется стойким алгоритмом. Исходный пароль и исходный verification code в базе не сохраняются.
+Passwords are hashed with a strong algorithm. Neither the plain password nor the
+plain verification code is stored.
 
-### 7.3. Вход
+### 7.3. Login
 
-1. Клиент отправляет email и пароль на `/auth/login`.
-2. Backend находит пользователя и проверяет хеш пароля.
-3. Backend проверяет статус пользователя и подтверждение email.
-4. Backend создаёт серверную refresh-session.
-5. Клиент получает короткоживущий access token и refresh token.
+1. The client sends email and password to `/auth/login`.
+2. The backend finds the user and checks the password hash.
+3. The backend checks the user status and email verification.
+4. The backend creates a server-side refresh session.
+5. The client receives a short-lived access token and a refresh token.
 
-Рекомендуемые сроки:
+After `LOGIN_MAX_ATTEMPTS` failed attempts (default 5) the account is locked for
+`LOGIN_LOCKOUT_MINUTES` (default 15).
 
-- access token — **15 минут**;
-- refresh token — **30 дней**;
-- email verification code — **10 минут**;
-- password reset code — **10 минут**.
+Default lifetimes:
 
-### 7.4. Хранение токенов на клиентах
+- access token — **15 minutes**;
+- refresh token — **30 days**;
+- email verification code — **10 minutes** (at most 5 attempts, resend cooldown 60 s, 5 codes per hour);
+- password reset token — **30 minutes**.
 
-Для Next.js:
+### 7.4. Token storage on clients
 
-- refresh token — `HttpOnly`, `Secure`, `SameSite=Lax` cookie;
-- access token — короткоживущий, хранится в памяти приложения;
-- не хранить токены в `localStorage`.
+Web (Next.js):
 
-Для React Native:
+- the current app keeps access and refresh tokens in `localStorage` and calls the
+  API through the Next.js `/api/v1` proxy; an `HttpOnly` cookie BFF is the
+  recommended production option.
 
-- refresh token — в защищённом системном хранилище устройства;
-- access token — в памяти приложения;
-- запросы передают access token в `Authorization: Bearer <token>`.
+React Native:
 
-В PostgreSQL хранится хеш refresh token, а не исходный token. При refresh старый refresh token заменяется новым. Повторное использование старого токена завершает всю связанную сессию.
+- refresh token — in the device's secure storage (`expo-secure-store`);
+- access token — in memory;
+- requests send `Authorization: Bearer <token>`.
 
-### 7.5. Разница между authentication и authorization
+PostgreSQL stores a hash of the refresh token, not the token itself. Each refresh
+replaces the old refresh token with a new one. Reusing an old token revokes the
+whole session.
 
-- **Authentication** отвечает на вопрос: «Кто пользователь?»
-- **Authorization** отвечает на вопрос: «Что этому пользователю разрешено?»
+### 7.5. Authentication vs authorization
 
-В BiletFlow authorization строится на ролях и владении ресурсом:
+- **Authentication** answers "Who is the user?"
+- **Authorization** answers "What is this user allowed to do?"
 
-| Роль/условие | Разрешения |
+In BiletFlow authorization is based on roles and resource ownership:
+
+| Role / condition | Permissions |
 |---|---|
-| Guest | Смотреть опубликованные публичные события |
-| User | Покупать билеты, видеть свои заказы и билеты |
-| Event owner | Полностью управлять собственным событием |
-| Event admin | Управлять конкретным событием в пределах выданных прав |
-| Check-in staff | Только проверять билеты назначенного события |
-| Platform admin | Управлять платформой, пользователями и спорными операциями |
+| Guest | View published public events |
+| User | Buy tickets, see own orders and tickets |
+| Event owner | Fully manage their own event |
+| Event admin | Check in tickets and reverse check-ins for an assigned event |
+| Check-in staff | Only check in tickets for an assigned event |
+| Platform admin | Manage the platform, users and disputed operations |
 
-Проверки выполняются на backend. Скрытая кнопка на frontend не является защитой.
+All checks run on the backend. A hidden button in the frontend is not protection.
 
-Пример логики:
+Example:
 
 ```python
 if current_user.global_role == "PLATFORM_ADMIN":
@@ -399,230 +532,230 @@ else:
     deny(status_code=403)
 ```
 
-### 7.6. Дополнительные auth-таблицы
+### 7.6. Auth tables
 
-К основной SQL-схеме необходимо добавить:
-
-| Таблица | Назначение |
+| Table | Purpose |
 |---|---|
-| `refresh_sessions` | Активные устройства, хеш refresh token, срок действия, отзыв |
-| `email_verification_tokens` | Хеш кода подтверждения email, срок и число попыток |
-| `password_reset_tokens` | Хеш кода сброса пароля, срок и факт использования |
+| `refresh_sessions` | Active devices, refresh token hash, expiry, revocation |
+| `email_verification_tokens` | Email code hash, expiry and attempt count |
+| `password_reset_tokens` | Reset token hash, expiry and whether it was used |
 
 ---
 
-## 8. Ключевые сценарии
+## 8. Key flows
 
-### 8.1. Покупка билета
+### 8.1. Buying a ticket
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant A as FastAPI
     participant D as PostgreSQL
-    participant P as Payment
+    participant P as Payment simulator
 
-    C->>A: Create order
+    C->>A: POST /orders
     A->>D: Lock inventory and create hold
     A-->>C: Order PENDING
-    C->>A: Start payment
-    A->>P: Create payment
-    P-->>A: Payment webhook
+    C->>A: POST /orders/{id}/payments/simulate
+    A->>P: Create simulated payment
+    C->>A: POST /orders/payments/{id}/simulate-result
     A->>D: Mark payment and order PAID
     A->>D: Consume hold and create tickets
-    A-->>P: 200 OK
+    A-->>C: Order PAID + tickets
 ```
 
-Операции после подтверждения оплаты выполняются в одной транзакции. Повторная обработка webhook должна возвращать успешный ответ, но не создавать новые билеты.
+Everything after the payment is confirmed runs in one transaction. Processing the
+same result again returns success but does not create new tickets.
 
 ### 8.2. Check-in
 
-1. Мобильное приложение сканирует QR-код.
-2. Отправляет токен и `event_id` в FastAPI.
-3. Backend хеширует полученный токен и ищет билет.
-4. PostgreSQL блокирует строку билета через `SELECT ... FOR UPDATE`.
-5. Backend проверяет событие и статус `VALID`.
-6. Статус меняется на `CHECKED_IN`, создаётся `checkin_record`.
-7. Повторное сканирование возвращает конфликт и время первого прохода.
+1. The mobile app scans the QR code.
+2. It sends the payload and `event_id` to FastAPI.
+3. The backend verifies the signature, hashes the payload and finds the ticket.
+4. PostgreSQL locks the ticket row with `SELECT ... FOR UPDATE`.
+5. The backend checks the event and the `VALID` status.
+6. The status becomes `CHECKED_IN` and a `checkin_record` is created.
+7. A repeated scan returns a conflict with the time of the first entry.
 
 ---
 
-## 9. Работа с PostgreSQL
+## 9. PostgreSQL
 
-PostgreSQL является единственным источником истины для пользователей, заказов, остатков, платежей и билетов.
+PostgreSQL is the single source of truth for users, orders, stock, payments and
+tickets.
 
-Обязательные правила:
+Rules:
 
-- UUID для бизнес-сущностей;
-- `TIMESTAMPTZ` для дат и времени;
-- денежные значения — `NUMERIC(12,2)`, не `float`;
-- миграции базы хранятся в Git;
-- финансовые, билетные и audit-записи не удаляются физически;
-- создание заказа, списание inventory и check-in используют транзакции;
-- внешние ключи и уникальные ограничения остаются в базе, а не только в Python;
-- запросы каталога, заказов и check-in должны использовать индексы из SQL-схемы.
+- UUIDs for business entities;
+- `TIMESTAMPTZ` for dates and times;
+- money as `NUMERIC(12,2)`, never `float`;
+- migrations live in Git (`sql/`);
+- financial, ticket and audit records are never physically deleted;
+- order creation, inventory changes and check-in use transactions;
+- foreign keys and unique constraints are enforced by the database, not only in Python;
+- catalog, order and check-in queries use the indexes from the SQL schema.
 
-### 9.1. Защита от overselling
+### 9.1. Overselling protection
 
-Во время создания резерва backend:
+When creating a hold the backend:
 
-1. начинает транзакцию;
-2. блокирует нужный `ticket_types`;
-3. считает оплаченные билеты и активные неистёкшие holds;
-4. сравнивает результат с capacity;
-5. создаёт hold либо возвращает `TICKET_SOLD_OUT`;
-6. завершает транзакцию.
+1. starts a transaction;
+2. locks the needed `ticket_types` rows;
+3. counts paid tickets and active, unexpired holds;
+4. compares the result with the capacity;
+5. creates the hold or returns `TICKET_SOLD_OUT`;
+6. commits.
 
-Обычная проверка остатка без блокировки недостаточна: два параллельных запроса могут одновременно увидеть последний билет.
+A plain stock check without a lock is not enough: two parallel requests could
+both see the last ticket.
 
 ---
 
 ## 10. Security
 
-- Только HTTPS вне локальной разработки.
-- Пароли хешируются и никогда не логируются.
-- Секреты находятся в environment variables, а `.env` не добавляется в Git.
-- Для login, verification и reset password вводится ограничение попыток.
-- Все входные данные валидируются FastAPI-схемами.
-- CORS разрешает только адреса Next.js и мобильного клиента в нужной среде.
-- Webhook оплаты проверяется по подписи провайдера.
-- Идентификатор объекта из URL всегда проверяется вместе с правами пользователя.
-- Для чувствительных операций создаётся audit log.
-- QR-токен должен быть случайным и непредсказуемым; в базе хранится только хеш.
+- HTTPS everywhere except local development.
+- Passwords are hashed and never logged.
+- Secrets are environment variables; `.env` is not committed.
+- Login, verification and password reset are rate-limited.
+- All input is validated by Pydantic schemas.
+- CORS allows only the web and mobile origins of the environment.
+- An object id from the URL is always checked together with the user's permissions.
+- Sensitive operations are written to the audit log.
+- Ticket QR payloads are HMAC-signed; only their hash is stored.
+- Uploaded images are decoded and re-encoded, which strips metadata such as GPS.
 
 ---
 
-## 11. Конфигурация
+## 11. Configuration
 
-Минимальный `.env.example`:
+Settings are read from the environment / `.env` (`app/core/config.py`). See
+`.env.example` for the full list. The most important ones:
 
-```dotenv
-APP_ENV=development
-APP_NAME=BiletFlow API
-API_PREFIX=/api/v1
-DATABASE_URL=postgresql://user:password@localhost:5432/biletflow
-JWT_ACCESS_SECRET=change-me
-JWT_REFRESH_SECRET=change-me
-ACCESS_TOKEN_TTL_MINUTES=15
-REFRESH_TOKEN_TTL_DAYS=30
-EMAIL_CODE_TTL_MINUTES=10
-FRONTEND_WEB_URL=http://localhost:3000
-CORS_ORIGINS=http://localhost:3000
-EMAIL_FROM=BiletFlow <no-reply@biletflow.local>
+| Variable | Default | Purpose |
+|---|---|---|
+| `APP_ENV` | `development` | `production` enables strict checks (Brevo required) |
+| `DATABASE_URL` | `postgresql+asyncpg://biletflow:biletflow@localhost:5432/biletflow` | PostgreSQL connection |
+| `REDIS_URL` | empty | Redis; empty uses the in-process store |
+| `CORS_ORIGINS` | empty | Comma-separated allowed origins, e.g. `http://localhost:3000,http://localhost:8081` |
+| `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET` | — | Required token signing secrets |
+| `TICKET_QR_SECRET` | — | Secret for signing ticket QR payloads |
+| `ACCESS_TOKEN_TTL_MINUTES` / `REFRESH_TOKEN_TTL_DAYS` | 15 / 30 | Token lifetimes |
+| `EMAIL_CODE_TTL_MINUTES`, `EMAIL_CODE_MAX_ATTEMPTS`, `EMAIL_CODE_RESEND_COOLDOWN_SECONDS`, `EMAIL_CODE_MAX_PER_HOUR` | 10, 5, 60, 5 | Verification code limits |
+| `LOGIN_MAX_ATTEMPTS` / `LOGIN_LOCKOUT_MINUTES` | 5 / 15 | Login lockout |
+| `PASSWORD_RESET_TTL_MINUTES` / `PASSWORD_RESET_URL` | 30 / empty | Reset token lifetime and link target |
+| `EMAIL_PROVIDER` | `dev` | `dev` (log only) or `brevo` |
+| `EMAIL_FROM`, `BREVO_API_KEY`, `BREVO_SENDER_EMAIL`, `BREVO_SENDER_NAME`, `BREVO_TIMEOUT_SECONDS` | — | Brevo email |
+| `PUBLIC_BASE_URL` | empty | Absolute API URL used in media links |
+| `PUBLIC_WEB_BASE_URL` | empty | Web app URL for links in emails and calendar files |
+| `ORDER_RESERVATION_TTL_MINUTES` | 10 | How long a pending order holds tickets |
+| `RESERVATION_CLEANUP_ENABLED` / `RESERVATION_CLEANUP_INTERVAL_SECONDS` | true / 60 | Background loop for expired orders and completed events |
+| `NOTIFICATION_RETRY_INTERVAL_SECONDS`, `NOTIFICATION_MAX_ATTEMPTS`, `NOTIFICATION_RETRY_BASE_SECONDS`, `NOTIFICATION_RETRY_MAX_SECONDS` | 60, 5, 30, 3600 | Email retries |
+| `EVENT_CANCELLATION_BATCH_SIZE` | 100 | Orders processed per batch when an event is cancelled |
+| `DEMO_SIMULATIONS_ENABLED` | true | Demo self-verification and payout approval |
+| `MEDIA_ROOT` / `MEDIA_MAX_UPLOAD_BYTES` | `media` / 5 MB | Image storage |
+| `APPLY_SCHEMA_ON_STARTUP` | true | Apply migrations when the app starts |
 
-# dev для локальной разработки; в production обязателен brevo.
-EMAIL_PROVIDER=dev
-BREVO_API_KEY=
-BREVO_SENDER_EMAIL=no-reply@your-verified-domain.com
-BREVO_SENDER_NAME=BiletFlow
-BREVO_TIMEOUT_SECONDS=10
-NOTIFICATION_RETRY_BASE_SECONDS=30
-NOTIFICATION_RETRY_MAX_SECONDS=3600
-PAYMENT_MODE=simulated
-```
+For Brevo the sender email must be verified in the Brevo account (Sender
+Authentication). `BREVO_SENDER_EMAIL`/`BREVO_SENDER_NAME` take priority; when
+they are empty the address from `EMAIL_FROM` is used. Automated tests always use
+`DevEmailProvider` and make no network calls.
 
-Для Brevo sender email должен быть подтверждён в аккаунте Brevo (Sender
-Authentication). `BREVO_SENDER_EMAIL`/`BREVO_SENDER_NAME` имеют приоритет; если
-не заданы, используется адрес из `EMAIL_FROM`. Автоматические тесты всегда
-используют `DevEmailProvider` и не делают сетевых вызовов.
-
-Реальные значения секретов не должны находиться в репозитории.
-
----
-
-## 12. Тестирование
-
-### Unit tests
-
-- расчёт цены и скидки;
-- допустимые переходы статусов;
-- проверка permissions;
-- создание и проверка токенов;
-- правила возврата.
-
-### Integration tests
-
-- операции repository с тестовой PostgreSQL;
-- транзакционное резервирование билетов;
-- повторная обработка payment webhook;
-- блокировка двойного check-in;
-- отзыв refresh-session.
-
-### E2E tests
-
-- регистрация → подтверждение email → login;
-- создание события → публикация;
-- покупка → оплата → получение QR-билета;
-- сканирование QR → повторное сканирование;
-- отмена/возврат.
+Real secret values must never be committed.
 
 ---
 
-## 13. Логирование и health checks
+## 12. Testing
 
-Логи должны содержать request ID, endpoint, HTTP status, duration и user ID, если пользователь авторизован. Пароли, access/refresh tokens, QR-токены и полные платёжные данные логировать запрещено.
+The suite in `tests/` covers auth, password reset, events, event staff,
+organizers, ticket types and orders, paid sales, tickets and check-in workflows,
+campaigns, refunds, support, admin and analytics, reports / settings / media,
+privacy and payout review, email provider and localization, error format,
+migrations, and the contract the frontend relies on. `TEST_REPORT.md` has an
+earlier test run report.
 
-Endpoints состояния:
+What the tests check:
+
+- **Unit:** price and discount calculation, allowed status transitions,
+  permissions, token creation and verification, refund rules.
+- **Integration:** repository operations, transactional ticket reservation,
+  repeated payment results, double check-in protection, refresh session
+  revocation.
+- **End-to-end flows:** register → verify email → login; create event → publish;
+  buy → pay → get a QR ticket; scan QR → scan again; cancel / refund.
+
+---
+
+## 13. Logging and health checks
+
+Logs contain the request ID, endpoint, HTTP status, duration and user ID when
+the user is signed in. Passwords, access/refresh tokens, QR payloads and full
+payment details are never logged.
 
 ```text
-GET /health/live   — процесс FastAPI запущен
-GET /health/ready  — FastAPI может подключиться к PostgreSQL
+GET /health/live   — the FastAPI process is running
+GET /health/ready  — PostgreSQL (and Redis, when configured) are reachable
 ```
 
 ---
 
-## 14. Порядок реализации
+## 14. Implementation order (as planned and completed)
 
-1. Создать FastAPI skeleton, конфигурацию и соединение с PostgreSQL.
-2. Подключить миграции и базовые модели пользователей.
-3. Реализовать email/password auth и refresh sessions.
-4. Реализовать роли, ownership и permissions.
-5. Реализовать события и типы билетов.
-6. Реализовать inventory holds и заказы.
-7. Подключить симулятор оплаты и идемпотентную обработку результата.
-8. Генерировать билеты и QR-токены.
-9. Реализовать check-in.
-10. Добавить campaigns, notifications, support и audit.
-11. Покрыть критичные сценарии интеграционными и E2E-тестами.
+1. FastAPI skeleton, configuration and PostgreSQL connection.
+2. Migrations and base user models.
+3. Email/password auth and refresh sessions.
+4. Roles, ownership and permissions.
+5. Events and ticket types.
+6. Inventory holds and orders.
+7. Payment simulator and idempotent result handling.
+8. Tickets and QR payloads.
+9. Check-in.
+10. Campaigns, notifications, support and audit.
+11. Refunds, administration, analytics, reports and platform settings.
+12. Integration tests for the critical flows.
 
 ---
 
-## 15. Принятые решения для Academic MVP
+## 15. Decisions for the Academic MVP
 
-| Вопрос | Решение |
+| Question | Decision |
 |---|---|
 | Backend | FastAPI |
 | Web | Next.js |
-| Mobile | React Native |
+| Mobile | React Native (Expo) |
 | Database | PostgreSQL |
-| Архитектура | Модульный монолит |
+| Architecture | Modular monolith |
 | API | REST `/api/v1` |
 | Login | Email + password |
-| Подтверждение | Одноразовый код на email |
-| Сессия | Access token + rotating refresh token |
-| Permissions | Global role + event ownership + event permissions |
-| Payment | Симулятор за адаптером для MVP |
-| Ticket | Одна запись на одного участника, QR с непрозрачным токеном |
-| SMS | Не входит в MVP |
-| OAuth2 login | После MVP при необходимости |
-| SSO | Не требуется для текущего типа продукта |
+| Verification | One-time code by email |
+| Session | Access token + rotating refresh token |
+| Permissions | Global role + event ownership + event staff roles |
+| Payment | Simulator behind an adapter |
+| Ticket | One row per attendee, HMAC-signed QR payload |
+| SMS | Not in the MVP |
+| OAuth2 login | After the MVP if needed |
+| SSO | Not needed for this product |
 
 ---
 
-## 16. Профиль организатора и Event Admin
+## 16. Organizer profile and Event Admin
 
-### 16.1. Профиль организатора
+### 16.1. Organizer profile
 
-Все endpoints требуют подтверждённый email (`Depends(require_verified_user)`) и работают только с профилем текущего JWT-пользователя. `user_id`, `verification_status`, `created_at` и `updated_at` нельзя задать через body.
+All endpoints require a verified email (`Depends(require_verified_user)`) and
+work only with the current JWT user's profile. `user_id`,
+`verification_status`, `created_at` and `updated_at` cannot be set in the body.
 
 ```http
-POST   /api/v1/organizers/me                  # создать профиль (201)
-GET    /api/v1/organizers/me                  # свой профиль (404 ORGANIZER_PROFILE_NOT_FOUND, если нет)
-PATCH  /api/v1/organizers/me                  # частичное обновление
-PUT    /api/v1/organizers/me/payout-account   # демонстрационный payout-аккаунт
+POST   /api/v1/organizers/me                  # create the profile (201)
+GET    /api/v1/organizers/me                  # own profile (404 ORGANIZER_PROFILE_NOT_FOUND if missing)
+PATCH  /api/v1/organizers/me                  # partial update
+GET    /api/v1/organizers/me/payout-account   # default (or newest) payout account, masked
+PUT    /api/v1/organizers/me/payout-account   # demo payout account
+GET    /api/v1/organizers/me/events           # own events
+GET    /api/v1/organizers/me/analytics        # totals across own events
 ```
 
-Пример создания профиля:
+Example:
 
 ```json
 {
@@ -634,23 +767,35 @@ PUT    /api/v1/organizers/me/payout-account   # демонстрационный
 }
 ```
 
-- Один пользователь — один `OrganizerProfile`; повторное создание → `409 ORGANIZER_PROFILE_ALREADY_EXISTS`.
-- `verification_status` начинается с `NOT_SUBMITTED` и меняется только бэкендом.
-- Payout — демонстрационная информация: `status` всегда `PENDING` при создании, `external_account_ref` маскируется в ответе (`****-001`). Номера карт/CVV не принимаются и не сохраняются.
-- Если `is_default=true`, предыдущий default-аккаунт этого организатора автоматически снимается (одна транзакция).
+- One user has one `OrganizerProfile`; creating it again →
+  `409 ORGANIZER_PROFILE_ALREADY_EXISTS`.
+- `verification_status` starts as `NOT_SUBMITTED` and is changed only by the backend
+  (a Platform Admin, or the demo `POST /organizers/me/verification/simulate`).
+- The payout account is demo data: `status` is always `PENDING` on creation and
+  `external_account_ref` is masked in responses (`****-001`). Card numbers / CVV
+  are neither accepted nor stored.
+- With `is_default=true` the organizer's previous default account is unset in the
+  same transaction.
 
 ### 16.2. Event Admin
 
-Event Admin — **event-scoped** роль (`event_staff.role = EVENT_ADMIN`), а не глобальная. При назначении `users.global_role` не меняется. Назначения не кладутся в JWT: права проверяются запросом к PostgreSQL на каждый вызов, поэтому удаление назначения действует немедленно.
+Event Admin is an **event-scoped** role (`event_staff.role = EVENT_ADMIN`), not a
+global one. Assigning it does not change `users.global_role`. Assignments are not
+put into the JWT: permissions are checked against PostgreSQL on every request, so
+removing an assignment takes effect immediately.
 
 ```http
-GET    /api/v1/events/assigned                        # события, где current_user имеет доступ к check-in: владелец или EVENT_ADMIN/CHECK_IN_STAFF (пагинация limit/offset)
-GET    /api/v1/events/{event_id}/admins               # список Event Admin события
-POST   /api/v1/events/{event_id}/admins               # назначить (body: {"email": "..."})
-DELETE /api/v1/events/{event_id}/admins/{user_id}     # удалить назначение (204)
+GET    /api/v1/events/assigned                        # events where current_user has check-in access: owner or EVENT_ADMIN/CHECK_IN_STAFF (limit/offset paging)
+GET    /api/v1/events/{event_id}/admins               # event admins of the event
+POST   /api/v1/events/{event_id}/admins               # assign (body: {"email": "..."})
+DELETE /api/v1/events/{event_id}/admins/{user_id}     # remove the assignment (204)
 ```
 
-Пример назначения:
+Each item of `/events/assigned` includes the caller-specific
+`can_reverse_check_in` flag (true for the owner, `PLATFORM_ADMIN` and
+`EVENT_ADMIN`; false for `CHECK_IN_STAFF`).
+
+Example:
 
 ```json
 {
@@ -658,70 +803,80 @@ DELETE /api/v1/events/{event_id}/admins/{user_id}     # удалить назн�
 }
 ```
 
-Правила назначения:
+Assignment rules:
 
-- назначать/удалять может только владелец события или `PLATFORM_ADMIN`;
-- целевой пользователь должен существовать, быть `ACTIVE` и иметь подтверждённый email;
-- нельзя назначить владельца администратором собственного события (`409 EVENT_OWNER_CANNOT_BE_ADMIN`);
-- повторное назначение `(event_id, user_id)` → `409 EVENT_ADMIN_ALREADY_ASSIGNED`;
-- Event Admin получает только `{"view_event": true, "check_in_tickets": true}` — он не может менять владельца, управлять персоналом или видеть другие события.
+- only the event owner or a `PLATFORM_ADMIN` can assign/remove;
+- the target user must exist, be `ACTIVE` and have a verified email;
+- the owner cannot be made admin of their own event (`409 EVENT_OWNER_CANNOT_BE_ADMIN`);
+- assigning the same `(event_id, user_id)` again → `409 EVENT_ADMIN_ALREADY_ASSIGNED`;
+- an Event Admin gets only `{"view_event": true, "check_in_tickets": true}` — they
+  cannot change the owner, manage staff or see other events.
 
-Event Admin видит только события, где есть запись `event_staff(event_id, user_id)`. Фильтрация выполняется SQL-join-ом `events ⋈ event_staff`, а не в Python.
+An Event Admin sees only events with an `event_staff(event_id, user_id)` row. The
+filtering is an SQL join `events ⋈ event_staff`, not Python code.
 
 ### 16.3. PLATFORM_ADMIN vs EVENT_ADMIN
 
 | | PLATFORM_ADMIN | EVENT_ADMIN |
 |---|---|---|
-| Область | Платформа целиком | Одно конкретное событие |
-| Хранение | `users.global_role` | строка в `event_staff` |
-| Назначение | вручную на бэкенде | владелец события или `PLATFORM_ADMIN` |
-| Видит события | любые | только назначенные |
-| Управляет персоналом события | да | нет |
-| Check-in события | да | да (пока назначение активно) |
+| Scope | Whole platform | One specific event |
+| Stored in | `users.global_role` | a row in `event_staff` |
+| Assigned by | server command (`make admin`) | event owner or `PLATFORM_ADMIN` |
+| Sees events | all | only assigned ones |
+| Manages event staff | yes | no |
+| Event check-in | yes | yes (while the assignment is active) |
 
 ### 16.4. Event-scoped authorization
 
-- `require_event_owner(event_id)` — владелец события или `PLATFORM_ADMIN` (управление персоналом).
-- `require_event_staff_role(*roles)` — только персонал события с указанной ролью.
-- `require_event_checkin_access(event_id)` — владелец, `PLATFORM_ADMIN` или активный `EVENT_ADMIN`/`CHECK_IN_STAFF` события. Предназначена для будущего check-in API.
+- `require_event_owner(event_id)` — event owner or `PLATFORM_ADMIN` (event management, staff).
+- `require_event_staff_role(*roles)` — only event staff with the given role.
+- `require_event_checkin_access(event_id)` — owner, `PLATFORM_ADMIN` or an active
+  `EVENT_ADMIN`/`CHECK_IN_STAFF` of the event. Used by the check-in API.
 
-Отказы фиксируются в `audit_logs` как `event.staff_access_denied`.
+Denials are recorded in `audit_logs` as `event.staff_access_denied`.
 
 ### 16.5. Audit
 
-| Действие | `action` |
+| Action | `action` |
 |---|---|
-| Создание профиля | `organizer.profile_created` |
-| Обновление профиля | `organizer.profile_updated` |
-| Изменение payout-аккаунта | `organizer.payout_account_updated` |
-| Назначение Event Admin | `event.admin_assigned` |
-| Удаление Event Admin | `event.admin_removed` |
-| Отказ в event-доступе | `event.staff_access_denied` |
+| Profile created | `organizer.profile_created` |
+| Profile updated | `organizer.profile_updated` |
+| Payout account changed | `organizer.payout_account_updated` |
+| Event Admin assigned | `event.admin_assigned` |
+| Event Admin removed | `event.admin_removed` |
+| Event access denied | `event.staff_access_denied` |
 
-В audit не попадают password hashes, JWT, refresh tokens и полные payout references.
+Password hashes, JWTs, refresh tokens and full payout references never go into
+the audit log.
 
-### 16.6. Локальный запуск тестов
+### 16.6. Running tests locally
 
 ```bash
-cp .env.example .env            # заполнить JWT_ACCESS_SECRET / JWT_REFRESH_SECRET
+cp .env.example .env            # fill in JWT_ACCESS_SECRET / JWT_REFRESH_SECRET
 pip install -e ".[dev]"         # pytest, aiosqlite, ruff, mypy
 make lint                       # ruff check app tests
 make typecheck                  # mypy
 make test                       # pytest
-make migrate                    # применить SQL-миграции к DATABASE_URL
+make migrate                    # apply SQL migrations to DATABASE_URL
 ```
 
-SQL-миграции (`sql/migrate_*.sql`) выполняются версионированно: каждая — ровно один раз, применённые версии хранятся в таблице `schema_migrations`. Базы, созданные до введения трекинга, определяются по существующим таблицам и получают базовые версии без повторного выполнения.
+SQL migrations (`sql/migrate_*.sql`) are versioned: each runs exactly once, and
+applied versions are stored in the `schema_migrations` table. Databases created
+before tracking was introduced are detected by their existing tables and get the
+base versions without running them again.
 
-Тесты по умолчанию используют sqlite in-memory (тестовый fallback проекта). Для прогона на отдельной тестовой PostgreSQL (включая тест параллельного резервирования и сценарии миграций):
+By default the tests use in-memory SQLite (the project's test fallback). To run
+against a separate PostgreSQL test database (including the parallel reservation
+test and migration scenarios):
 
 ```bash
 TEST_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/test_db make test
 ```
 
-CI (`.github/workflows/ci.yml`) выполняет lint, typecheck, тесты на sqlite и полный сьют на PostgreSQL 17.
-
-
+CI (`.github/workflows/ci.yml`) runs lint, typecheck, the tests on SQLite and the
+full suite on PostgreSQL 17. `deploy.yml` deploys over SSH after CI passes on
+`main` (only when `CD_ENABLED=true`, and only if `main` has not moved since the
+CI run).
 
 ## Paid ticket sales (demo payment simulation)
 
@@ -1497,3 +1652,201 @@ Apply with `make migrate` (or on startup).
 `platform_settings` (seeded with id 1). Additive; apply with `make migrate` or
 on startup. New dependencies: `python-multipart`, `pillow` (already installed
 through `qrcode[pil]`).
+
+## Endpoint reference
+
+All paths are under `/api/v1`. Interactive docs with request/response schemas: `/docs` (Swagger UI) and `/openapi.json`.
+
+### Auth
+
+| Method | Path |
+|---|---|
+| `POST` | `/auth/register` |
+| `POST` | `/auth/verify-email` |
+| `POST` | `/auth/resend-verification` |
+| `POST` | `/auth/login` |
+| `POST` | `/auth/refresh` |
+| `POST` | `/auth/logout` |
+| `POST` | `/auth/logout-all` |
+| `POST` | `/auth/request-password-reset` |
+| `POST` | `/auth/reset-password` |
+
+### Users
+
+| Method | Path |
+|---|---|
+| `GET` | `/users/me` |
+| `PATCH` | `/users/me` |
+| `GET` | `/users/me/notifications` |
+| `POST` | `/users/me/notifications/{notification_id}/read` |
+| `GET` | `/users/me/reports` |
+
+### Organizers
+
+| Method | Path |
+|---|---|
+| `POST` | `/organizers/me` |
+| `GET` | `/organizers/me` |
+| `PATCH` | `/organizers/me` |
+| `POST` | `/organizers/me/verification/simulate` |
+| `GET` | `/organizers/me/payout-account` |
+| `POST` | `/organizers/me/payout-account/simulate-approval` |
+| `PUT` | `/organizers/me/payout-account` |
+| `GET` | `/organizers/me/events` |
+| `GET` | `/organizers/me/analytics` |
+
+### Events, ticket types, inventory, paid sales
+
+| Method | Path |
+|---|---|
+| `GET` | `/events/assigned` |
+| `GET` | `/events/{event_id}/admins` |
+| `POST` | `/events/{event_id}/admins` |
+| `DELETE` | `/events/{event_id}/admins/{user_id}` |
+| `GET` | `/events/catalog` |
+| `POST` | `/events` |
+| `GET` | `/events` |
+| `GET` | `/events/{event_id}` |
+| `PATCH` | `/events/{event_id}` |
+| `DELETE` | `/events/{event_id}` |
+| `POST` | `/events/{event_id}/duplicate` |
+| `GET` | `/events/{event_id}/preview` |
+| `POST` | `/events/{event_id}/publish` |
+| `POST` | `/events/{event_id}/unpublish` |
+| `POST` | `/events/{event_id}/cancel` |
+| `GET` | `/events/{event_id}/cancellation` |
+| `GET` | `/events/{event_id}/refund-policy` |
+| `PUT` | `/events/{event_id}/refund-policy` |
+| `GET` | `/events/{event_id}/audit-log` |
+| `GET` | `/events/{event_id}/paid-sales/activation` |
+| `POST` | `/events/{event_id}/paid-sales/terms` |
+| `POST` | `/events/{event_id}/paid-sales/activation-fee` |
+| `POST` | `/events/{event_id}/paid-sales/activate` |
+| `POST` | `/events/{event_id}/ticket-types` |
+| `GET` | `/events/{event_id}/ticket-types` |
+| `PATCH` | `/events/{event_id}/ticket-types/{ticket_type_id}` |
+| `DELETE` | `/events/{event_id}/ticket-types/{ticket_type_id}` |
+| `GET` | `/events/{event_id}/attendees` |
+| `GET` | `/events/{event_id}/inventory` |
+| `POST` | `/events/{event_id}/ticket-types/{ticket_type_id}/holds` |
+| `POST` | `/events/{event_id}/ticket-types/{ticket_type_id}/purchase` |
+| `GET` | `/events/{event_id}/analytics` |
+| `GET` | `/events/{event_id}/timeline` |
+| `POST` | `/events/{event_id}/images/upload` |
+| `GET` | `/events/{event_id}/calendar.ics` |
+| `POST` | `/events/{event_id}/reports` |
+
+### Campaigns
+
+| Method | Path |
+|---|---|
+| `POST` | `/events/{event_id}/campaigns` |
+| `GET` | `/events/{event_id}/campaigns` |
+| `GET` | `/events/{event_id}/campaigns/analytics` |
+| `GET` | `/events/{event_id}/campaigns/{campaign_id}` |
+| `PATCH` | `/events/{event_id}/campaigns/{campaign_id}` |
+| `GET` | `/events/{event_id}/campaigns/{campaign_id}/analytics` |
+| `GET` | `/events/{event_id}/campaigns/{campaign_id}/qr.png` |
+| `POST` | `/campaigns/validate` |
+| `GET` | `/campaigns/qr/{campaign_token}` |
+
+### Orders, payments, refunds
+
+| Method | Path |
+|---|---|
+| `POST` | `/orders` |
+| `POST` | `/orders/{order_id}/payments/simulate` |
+| `POST` | `/orders/payments/{payment_id}/simulate-result` |
+| `GET` | `/orders` |
+| `GET` | `/orders/{order_id}/tickets` |
+| `GET` | `/orders/{order_id}` |
+| `POST` | `/orders/{order_id}/confirm` |
+| `POST` | `/orders/{order_id}/checkout` |
+| `POST` | `/orders/{order_id}/cancel` |
+| `POST` | `/orders/{order_id}/refund` |
+| `GET` | `/orders/{order_id}/refunds` |
+| `GET` | `/orders/{order_id}/refund-eligibility` |
+
+### Tickets and check-in
+
+| Method | Path |
+|---|---|
+| `GET` | `/tickets` |
+| `GET` | `/tickets/{public_id}` |
+| `GET` | `/tickets/{public_id}/pdf` |
+| `GET` | `/tickets/{public_id}/download` |
+| `POST` | `/events/{event_id}/tickets/validate` |
+| `POST` | `/events/{event_id}/validate` |
+| `POST` | `/events/{event_id}/check-in` |
+| `POST` | `/events/{event_id}/checkin` |
+| `POST` | `/events/{event_id}/tickets/check-in` |
+| `GET` | `/events/{event_id}/tickets/search` |
+| `GET` | `/events/{event_id}/attendees/search` |
+| `GET` | `/events/{event_id}/tickets/stats` |
+| `POST` | `/events/{event_id}/tickets/{public_id}/check-in` |
+| `POST` | `/events/{event_id}/tickets/{public_id}/reverse-check-in` |
+
+### Support
+
+| Method | Path |
+|---|---|
+| `POST` | `/support/cases` |
+| `GET` | `/support/cases` |
+| `GET` | `/support/cases/{case_id}` |
+| `GET` | `/support/cases/{case_id}/messages` |
+| `POST` | `/support/cases/{case_id}/messages` |
+| `PATCH` | `/support/cases/{case_id}` |
+| `PATCH` | `/support/cases/{case_id}/status` |
+| `PATCH` | `/support/cases/{case_id}/assignee` |
+| `GET` | `/support/cases/{case_id}/assignees` |
+| `GET` | `/support/cases/{case_id}/assignable-users` |
+| `POST` | `/support/cases/{case_id}/escalate` |
+| `GET` | `/support/cases/{case_id}/activity` |
+
+### Admin (`PLATFORM_ADMIN` only)
+
+| Method | Path |
+|---|---|
+| `GET` | `/admin/users` |
+| `GET` | `/admin/users/{user_id}` |
+| `POST` | `/admin/users/{user_id}/suspend` |
+| `POST` | `/admin/users/{user_id}/unsuspend` |
+| `GET` | `/admin/events` |
+| `GET` | `/admin/events/{event_id}` |
+| `POST` | `/admin/events/{event_id}/suspend` |
+| `POST` | `/admin/events/{event_id}/unsuspend` |
+| `POST` | `/admin/events/{event_id}/paid-sales/stop` |
+| `POST` | `/admin/events/{event_id}/paid-sales/resume` |
+| `GET` | `/admin/orders` |
+| `GET` | `/admin/payments` |
+| `GET` | `/admin/activations` |
+| `GET` | `/admin/refunds` |
+| `GET` | `/admin/failures` |
+| `GET` | `/admin/support/escalated` |
+| `GET` | `/admin/actions` |
+| `GET` | `/admin/campaigns` |
+| `GET` | `/admin/export/{kind}.csv` |
+| `GET` | `/admin/disputes` |
+| `POST` | `/admin/disputes` |
+| `PATCH` | `/admin/disputes/{dispute_id}` |
+| `POST` | `/admin/organizers/{user_id}/verification` |
+| `GET` | `/admin/payout-accounts` |
+| `POST` | `/admin/payout-accounts/{account_id}/status` |
+| `GET` | `/admin/reports` |
+| `GET` | `/admin/reports/{report_id}` |
+| `PATCH` | `/admin/reports/{report_id}` |
+| `GET` | `/admin/settings` |
+| `PATCH` | `/admin/settings` |
+
+### Media
+
+| Method | Path |
+|---|---|
+| `GET` | `/media/{key:path}` |
+
+### Health (no prefix)
+
+| Method | Path |
+|---|---|
+| `GET` | `/health/live` |
+| `GET` | `/health/ready` |
